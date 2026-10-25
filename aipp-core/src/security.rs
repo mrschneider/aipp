@@ -14,6 +14,7 @@
 //! * **Hash chain** over the audit log, so tampering is detectable.
 
 use crate::error::{AippError, ErrorKind};
+use digest::KeyInit;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::collections::VecDeque;

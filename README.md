@@ -1,4 +1,8 @@
-# AIPP — Agentic Internet & Presence Protocol
+# AIPP
+
+> **The normative document is [SPEC.md](SPEC.md).** This README describes
+> the reference implementation; where the two disagree, the spec wins and
+> the code is wrong. — Agentic Internet & Presence Protocol
 
 **IRC's channels for routing. ICQ's presence for scheduling. One socket for both.**
 

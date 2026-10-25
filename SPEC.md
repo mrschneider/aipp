@@ -286,9 +286,36 @@ The reference implementation additionally passes 40k hostile-input
 mutations (no panic, no over-allocation) and three end-to-end
 experiments (dual plane, hardening, TLS).
 
-## 13. Deliberately out of scope
+## 13. Federation between brokers (v1.0)
 
-* Federation between brokers (design sketched, not specified here).
+Brokers link to each other and speak AIPP over the link. Two link-only
+commands exist, and agents MUST NOT be able to forge them (the broker
+intercepts them before the agent grammar):
+
+```
+FEDERATE <broker-id>          dialer introduces itself
+FEDERATED <broker-id>         acceptor answers, both sides now linked
+RELAY <msg-id> <hops> <origin-broker> <sender> <target> :<text>
+```
+
+* A direct message whose target is unknown locally is relayed to every
+  link; the origin is answered `RELAYED <target> <links>` — "entered the
+  mesh", not "delivered".
+* The relay is delivered when a broker knows the target, held by that
+  broker's store-and-forward if the agent is registered but unreachable,
+  or forwarded onward otherwise.
+* **Loop safety is structural**: flooding is deduped by `msg-id` (each
+  broker keeps a bounded seen-set) and bounded by `hops` (8). A relay
+  that arrives at its origin broker is dropped.
+* **Delivery guarantee: none.** Flooding without acknowledgements is
+  at-most-once *at best*. A relay that reaches a broker which does not
+  know the target and has no further links is dropped and journaled.
+  Any claim of guaranteed delivery would be false.
+* Channel fan-out is local in v1.0: `#channels` do not cross links, and
+  a relayed channel message is dropped rather than half-delivered.
+* Link peers are trusted by address; there is no broker authentication.
+
+## 14. Deliberately out of scope
 * Broker authentication (peer brokers are trusted by address today).
 * Payload schema registry beyond the TLV type table.
 * Compression.

@@ -24,7 +24,7 @@ use aipp_core::security::{cap, Authority, Identity, RateLimiter};
 use aipp_core::tlv::Reassembler;
 use aipp_core::tlv::{tlv_label, Frame};
 use serde_json::json;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -61,6 +61,8 @@ struct Conn {
     limiter: Mutex<RateLimiter>,
     /// fragments arriving for one announced (large) frame
     reasm: Mutex<Reassembler>,
+    /// set when this connection is a broker-to-broker link
+    peer_id: Mutex<Option<String>>,
 }
 
 impl Conn {
@@ -107,6 +109,13 @@ struct Broker {
     store_max: usize,
     /// channels survive a restart; connections never do
     state_path: Option<PathBuf>,
+    /// broker-to-broker links, by the peer's broker id
+    peers: BTreeMap<String, Arc<Conn>>,
+    /// this broker's identity on the link
+    broker_id: String,
+    /// relay message ids already seen: flooding without dedup is a storm
+    seen: VecDeque<String>,
+    seq: u64,
 }
 
 impl Broker {
@@ -125,6 +134,10 @@ impl Broker {
             store_ttl: Duration::from_secs(900),
             store_max: 256,
             state_path: None,
+            peers: BTreeMap::new(),
+            broker_id: String::new(),
+            seen: VecDeque::new(),
+            seq: 0,
         }
     }
 
@@ -226,6 +239,22 @@ impl Broker {
                 );
             }
         }
+    }
+
+    fn saw(&mut self, msg_id: &str) -> bool {
+        if self.seen.iter().any(|m| m == msg_id) {
+            return true;
+        }
+        self.seen.push_back(msg_id.to_string());
+        while self.seen.len() > 4096 {
+            self.seen.pop_front();
+        }
+        false
+    }
+
+    fn next_msg_id(&mut self) -> String {
+        self.seq += 1;
+        format!("{}-{}", self.broker_id, self.seq)
     }
 
     fn journal(&self, ev: &str, detail: serde_json::Value) {
@@ -330,6 +359,8 @@ fn main() {
     let mut state_path: Option<PathBuf> = None;
     let mut tls_cert: Option<String> = None;
     let mut tls_key: Option<String> = None;
+    let mut peers: Vec<String> = Vec::new();
+    let mut broker_id: String = String::new();
     let mut max_cmds_per_sec: u32 = 0;
     let mut max_bytes_per_sec: u32 = 0;
 
@@ -344,6 +375,8 @@ fn main() {
             "--state" => state_path = args.next().map(PathBuf::from),
             "--tls-cert" => tls_cert = args.next(),
             "--tls-key" => tls_key = args.next(),
+            "--peer" => peers.push(args.next().unwrap_or_default()),
+            "--id" => broker_id = args.next().unwrap_or_default(),
             "--max-cmds-per-sec" => {
                 max_cmds_per_sec = args.next().and_then(|p| p.parse().ok()).unwrap_or(0)
             }
@@ -404,6 +437,11 @@ fn main() {
     broker_state.max_cmds_per_sec = max_cmds_per_sec;
     broker_state.max_bytes_per_sec = max_bytes_per_sec;
     broker_state.state_path = state_path;
+    broker_state.broker_id = if broker_id.is_empty() {
+        format!("b{port}")
+    } else {
+        broker_id
+    };
     broker_state.load_state();
     let broker = Arc::new(Mutex::new(broker_state));
     let next_id = Arc::new(AtomicU64::new(1));
@@ -429,6 +467,51 @@ fn main() {
                 }
                 b.journal("presence_quit", json!({"agent": name, "reason": "ttl"}));
             }
+        });
+    }
+
+    // outbound links: dial each --peer and introduce ourselves
+    for addr in peers.clone() {
+        let broker = broker.clone();
+        let next_id = next_id.clone();
+        let my_id = broker.lock().unwrap().broker_id.clone();
+        std::thread::spawn(move || {
+            for attempt in 0..5 {
+                match TcpStream::connect(&addr) {
+                    Ok(stream) => {
+                        let _ = stream.set_nodelay(true);
+                        let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+                        let io: Io = Arc::new(Mutex::new(Box::new(stream) as Box<dyn ReadWrite>));
+                        let limits = {
+                            let b = broker.lock().unwrap();
+                            (b.max_cmds_per_sec, b.max_bytes_per_sec)
+                        };
+                        let id = next_id.fetch_add(1, Ordering::SeqCst);
+                        let out = Outbox::spawn(OutHandle(io.clone()), 256);
+                        let conn = Arc::new(Conn {
+                            id,
+                            name: Mutex::new(None),
+                            out: Arc::new(out),
+                            pending: Mutex::new(None),
+                            identity: Mutex::new(None),
+                            caps: Mutex::new(0),
+                            limiter: Mutex::new(RateLimiter::new(limits.0, limits.1)),
+                            reasm: Mutex::new(Reassembler::new()),
+                            peer_id: Mutex::new(None),
+                        });
+                        {
+                            let mut b = broker.lock().unwrap();
+                            b.conns.insert(id, conn.clone());
+                        }
+                        conn.send_line(&format!("FEDERATE {my_id}"));
+                        b_journal(&broker, "dial", json!({"peer": addr, "attempt": attempt}));
+                        serve(broker, conn, io);
+                        return;
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(300)),
+                }
+            }
+            b_journal(&broker, "dial_failed", json!({"peer": addr}));
         });
     }
 
@@ -461,6 +544,7 @@ fn main() {
             caps: Mutex::new(0),
             limiter: Mutex::new(RateLimiter::new(limits.0, limits.1)),
             reasm: Mutex::new(Reassembler::new()),
+            peer_id: Mutex::new(None),
         });
         {
             let mut b = broker.lock().unwrap();
@@ -675,11 +759,130 @@ fn read_item(reader: &mut BufReader<TcpStream>) -> std::io::Result<Option<Item>>
     }
 }
 
+/// Register a link. Both directions land here: the dialer sees
+/// `FEDERATED <id>`, the acceptor sees `FEDERATE <id>`.
+fn handle_federate(broker: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, peer_id: &str) {
+    if peer_id.is_empty() {
+        conn.send_line("ERR 461 :FEDERATE needs a broker id");
+        return;
+    }
+    let my_id = {
+        let mut b = broker.lock().unwrap();
+        b.peers.insert(peer_id.to_string(), conn.clone());
+        b.broker_id.clone()
+    };
+    *conn.peer_id.lock().unwrap() = Some(peer_id.to_string());
+    b_journal(broker, "federate", json!({"peer": peer_id}));
+    // the acceptor answers; the dialer learns the peer's id
+    conn.send_line(&format!("FEDERATED {my_id}"));
+}
+
+fn b_journal(broker: &Arc<Mutex<Broker>>, ev: &str, detail: serde_json::Value) {
+    broker.lock().unwrap().journal(ev, detail);
+}
+
+/// One federated hop: deliver locally when the target lives here, else
+/// forward to every other link. Flooding is bounded by hops and deduped
+/// by message id, so A<->B<->C cannot loop.
+fn handle_relay(broker: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, line: &str) {
+    let parts: Vec<&str> = line.splitn(6, ' ').collect();
+    if parts.len() < 6 {
+        conn.send_line("ERR 461 :RELAY <msg-id> <hops> <origin> <sender> <target> :<text>");
+        return;
+    }
+    let msg_id = parts[1];
+    let hops: usize = parts[2].parse().unwrap_or(usize::MAX);
+    let origin = parts[3].to_string();
+    let sender = parts[4].to_string();
+    let rest = parts[5];
+    let (target, text) = match rest.split_once(" :") {
+        Some((t, x)) => (t.to_string(), x.to_string()),
+        None => return,
+    };
+    let my_id;
+    {
+        let mut b = broker.lock().unwrap();
+        if b.saw(msg_id) {
+            b.journal("relay_dup", json!({"id": msg_id}));
+            return;
+        }
+        my_id = b.broker_id.clone();
+        if origin == my_id {
+            // it came home: every other broker already saw it
+            b.journal("relay_returned", json!({"id": msg_id}));
+            return;
+        }
+        if target.starts_with('#') {
+            // channel fan-out is local in v1; a relayed channel message
+            // is dropped rather than half-delivered
+            b.journal("relay_chan_drop", json!({"id": msg_id}));
+            return;
+        }
+        if b.agents.contains_key(&target) {
+            // it lives here: deliver, or hold it if the agent is offline
+            let line = format!(":{sender} PRIVMSG {target} :{text}");
+            match b.conn_of(&target) {
+                Some(c) => c.send_line(&line),
+                None => {
+                    let n = b.store_for(&target, &sender, &text);
+                    b.journal("relay_stored", json!({"to": target, "queued": n}));
+                }
+            }
+            b.journal(
+                "relay_delivered",
+                json!({"id": msg_id, "from": sender, "to": target, "hops": hops}),
+            );
+            return;
+        }
+        if hops >= 8 {
+            b.journal("relay_hop_limit", json!({"id": msg_id, "hops": hops}));
+            return;
+        }
+        // forward to every link except the one it came in on
+        let peers: Vec<Arc<Conn>> = b
+            .peers
+            .values()
+            .filter(|p| !Arc::ptr_eq(p, conn))
+            .cloned()
+            .collect();
+        if peers.is_empty() {
+            b.journal("relay_dead_end", json!({"id": msg_id, "to": target}));
+            return;
+        }
+        let fwd = format!(
+            "RELAY {msg_id} {} {origin} {sender} {target} :{text}",
+            hops + 1
+        );
+        for p in &peers {
+            p.send_line(&fwd);
+        }
+        b.journal(
+            "relay_forwarded",
+            json!({"id": msg_id, "to": target, "peers": peers.len(), "hops": hops + 1}),
+        );
+    }
+}
+
 fn name_of(conn: &Conn) -> Option<String> {
     conn.name.lock().unwrap().clone()
 }
 
 fn handle_line(broker: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, line: &str) -> Result<(), ()> {
+    // broker-to-broker link traffic is not part of the agent grammar: it
+    // is intercepted before Command::parse so agents can never forge it
+    let trimmed = line.trim();
+    if let Some(rest) = trimmed.strip_prefix("FEDERATE ") {
+        handle_federate(broker, conn, rest.trim());
+        return Ok(());
+    }
+    if let Some(rest) = trimmed.strip_prefix("FEDERATED ") {
+        handle_federate(broker, conn, rest.trim());
+        return Ok(());
+    }
+    if trimmed.starts_with("RELAY ") {
+        handle_relay(broker, conn, trimmed);
+        return Ok(());
+    }
     let cmd = match Command::parse(line) {
         Ok(c) => c,
         Err(e) => {
@@ -939,6 +1142,24 @@ fn handle_line(broker: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, line: &str) -> Res
                 // a direct message to an agent that is not connected is
                 // held, not lost: store-and-forward is the point of knowing
                 // an agent is OFFLINE
+                if !target.starts_with('#')
+                    && !b.agents.contains_key(&target)
+                    && !b.peers.is_empty()
+                {
+                    // federation: the target may live behind a link. Flooding
+                    // is bounded by hops and deduped by message id.
+                    let msg_id = b.next_msg_id();
+                    let my_id = b.broker_id.clone();
+                    let n = b.peers.len();
+                    let fwd = format!("RELAY {msg_id} 0 {my_id} {me} {target} :{text}");
+                    for p in b.peers.values() {
+                        p.send_line(&fwd);
+                    }
+                    b.journal("relay_out", json!({"id": msg_id, "to": target, "peers": n}));
+                    drop(b);
+                    conn.send_line(&format!("RELAYED {target} {n}"));
+                    return Ok(());
+                }
                 if !target.starts_with('#') && b.conn_of(&target).is_none() {
                     let n = b.store_for(&target, &me, &text);
                     b.journal("stored", json!({"from": me, "to": target, "queued": n}));

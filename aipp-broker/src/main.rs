@@ -17,7 +17,7 @@
 
 use aipp_core::channel::Registry;
 use aipp_core::control::is_pool;
-use aipp_core::control::Command;
+use aipp_core::control::{Command, RosterOp};
 use aipp_core::flow::{FlowError, Outbox};
 use aipp_core::presence::AgentRecord;
 use aipp_core::security::{cap, Authority, Identity, RateLimiter};
@@ -116,6 +116,9 @@ struct Broker {
     /// relay message ids already seen: flooding without dedup is a storm
     seen: VecDeque<String>,
     seq: u64,
+    /// server-side roster: ag-id -> the targets it follows. Survives a
+    /// restart, so an agent that registers inherits its social context.
+    rosters: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl Broker {
@@ -138,6 +141,7 @@ impl Broker {
             broker_id: String::new(),
             seen: VecDeque::new(),
             seq: 0,
+            rosters: BTreeMap::new(),
         }
     }
 
@@ -194,7 +198,17 @@ impl Broker {
                        "topic": c.topic, "bans": c.bans})
             })
             .collect();
-        let doc = json!({"version": 1, "channels": chans});
+        let rosters: serde_json::Map<String, serde_json::Value> = self
+            .rosters
+            .iter()
+            .map(|(ag, set)| {
+                (
+                    ag.clone(),
+                    json!(set.iter().cloned().collect::<Vec<String>>()),
+                )
+            })
+            .collect();
+        let doc = json!({"version": 1, "channels": chans, "rosters": rosters});
         let tmp = path.with_extension("tmp");
         if std::fs::write(&tmp, doc.to_string()).is_ok() {
             let _ = std::fs::rename(&tmp, path);
@@ -210,6 +224,17 @@ impl Broker {
             eprintln!("[aipp] state file {path:?} is not valid JSON; ignoring it");
             return;
         };
+        if let Some(rs) = doc.get("rosters").and_then(|r| r.as_object()) {
+            for (ag, list) in rs {
+                if let Some(arr) = list.as_array() {
+                    let set: BTreeSet<String> = arr
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect();
+                    self.rosters.insert(ag.clone(), set);
+                }
+            }
+        }
         if let Some(chans) = doc.get("channels").and_then(|c| c.as_array()) {
             for c in chans {
                 let name = c.get("name").and_then(|v| v.as_str()).unwrap_or_default();
@@ -994,6 +1019,7 @@ fn handle_line(broker: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, line: &str) -> Res
             state,
             vram_free_mb,
             active_tasks,
+            status_text,
         } => {
             let me = name_of(conn).unwrap();
             if agent != me {
@@ -1005,6 +1031,7 @@ fn handle_line(broker: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, line: &str) -> Res
                 let mut b = broker.lock().unwrap();
                 if let Some(a) = b.agents.get_mut(&me) {
                     a.set_status(state, vram_free_mb, active_tasks);
+                    a.status_text = status_text.clone();
                     a.touch(Instant::now());
                 }
                 line_out = b
@@ -1015,9 +1042,23 @@ fn handle_line(broker: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, line: &str) -> Res
                 b.journal(
                     "status",
                     json!({"ag_id": me, "state": state.label(),
-                           "vram_free_mb": vram_free_mb, "active_tasks": active_tasks}),
+                           "vram_free_mb": vram_free_mb, "active_tasks": active_tasks,
+                           "status_text": status_text}),
                 );
+                // roster subscribers see the presence even without a
+                // shared channel: that is what "following" means
+                let watchers: Vec<String> = b
+                    .rosters
+                    .iter()
+                    .filter(|(_, set)| set.contains(&me))
+                    .map(|(ag, _)| ag.clone())
+                    .collect();
                 b.broadcast_presence(&me, &line_out);
+                for w in watchers {
+                    if let Some(c) = b.conn_of(&w) {
+                        c.send_line(&line_out);
+                    }
+                }
             }
             conn.send_line(&format!("STATS_OK {me}"));
         }
@@ -1440,6 +1481,65 @@ fn handle_line(broker: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, line: &str) -> Res
             conn.send_line(&format!(
                 "DRAINING {me} :new tasks will not be dispatched to you"
             ));
+        }
+        Command::Roster { op, target } => {
+            let me = name_of(conn).unwrap();
+            match op {
+                aipp_core::control::RosterOp::List => {
+                    let rows: Vec<String> = {
+                        let b = broker.lock().unwrap();
+                        b.rosters
+                            .get(&me)
+                            .map(|set| set.iter().cloned().collect())
+                            .unwrap_or_default()
+                    };
+                    conn.send_line(&format!("ROSTER_START {}", rows.len()));
+                    for t in rows {
+                        conn.send_line(&format!("ROSTER {t}"));
+                    }
+                    conn.send_line("ROSTER_END");
+                }
+                RosterOp::Add => {
+                    let t = target.unwrap_or_default();
+                    if t.is_empty() {
+                        reply_err(conn, 461, "ROSTER ADD needs a target");
+                        return Ok(());
+                    }
+                    {
+                        let mut b = broker.lock().unwrap();
+                        b.rosters.entry(me.clone()).or_default().insert(t.clone());
+                        b.save_state();
+                        b.journal("roster_add", json!({"ag_id": me, "target": t}));
+                    }
+                    conn.send_line(&format!("ROSTER_ADDED {t}"));
+                }
+                RosterOp::Del => {
+                    let t = target.unwrap_or_default();
+                    let removed = {
+                        let mut b = broker.lock().unwrap();
+                        let mut removed = false;
+                        if let Some(set) = b.rosters.get_mut(&me) {
+                            removed = set.remove(&t);
+                            if set.is_empty() {
+                                b.rosters.remove(&me);
+                            }
+                        }
+                        if removed {
+                            b.save_state();
+                        }
+                        b.journal(
+                            "roster_del",
+                            json!({"ag_id": me, "target": t, "removed": removed}),
+                        );
+                        removed
+                    };
+                    if removed {
+                        conn.send_line(&format!("ROSTER_REMOVED {t}"));
+                    } else {
+                        reply_err(conn, 401, &format!("{t} is not in your roster"));
+                    }
+                }
+            }
         }
         Command::Quit { reason } => {
             let me = name_of(conn).unwrap();

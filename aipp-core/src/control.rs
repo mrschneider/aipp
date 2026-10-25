@@ -24,6 +24,8 @@ pub enum Command {
         state: PresenceState,
         vram_free_mb: u32,
         active_tasks: u32,
+        /// the away/status message: the *why* behind the state
+        status_text: Option<String>,
     },
     /// `JOIN #channel`
     Join(String),
@@ -74,6 +76,12 @@ pub enum Command {
     Who(Option<String>),
     /// `DRAIN` — stop accepting new work, finish what is in flight.
     Drain,
+    /// server-side roster: `ROSTER ADD <target>` / `ROSTER DEL <target>` /
+    /// `ROSTER` — the contact list the broker persists for this agent.
+    Roster {
+        op: RosterOp,
+        target: Option<String>,
+    },
     /// `BIN_FRAME <#channel|nick> <tlv_type_hex> <length>` — announces
     /// that the next item on the wire is a binary frame of that size.
     BinFrame {
@@ -97,6 +105,13 @@ fn split_trailing(line: &str) -> (Vec<&str>, Option<&str>) {
 
 /// `@pool:name` addresses a group of agents; the broker picks a live one
 /// by presence. `#channel` addresses a channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RosterOp {
+    List,
+    Add,
+    Del,
+}
+
 pub fn parse_target(name: &str) -> Result<String, String> {
     if name.starts_with('@') {
         let pool = name.strip_prefix('@').unwrap_or(name);
@@ -168,7 +183,7 @@ impl Command {
             }
             "STATUS" => {
                 let agent = arg(0, "agent id")?;
-                let state_raw = arg(1, "presence state (0x00..0x04)")?;
+                let state_raw = arg(1, "presence state (0x00..0x05)")?;
                 let state = PresenceState::from_hex(state_raw)
                     .ok_or_else(|| format!("STATUS: unknown presence state '{state_raw}'"))?;
                 let vram = arg(2, "vram_free_mb")?
@@ -182,6 +197,7 @@ impl Command {
                     state,
                     vram_free_mb: vram,
                     active_tasks: tasks,
+                    status_text: trailing.map(str::to_string),
                 })
             }
             "JOIN" => Ok(Command::Join(parse_channel(arg(0, "channel")?)?)),
@@ -210,6 +226,21 @@ impl Command {
                 Ok(Command::Who(args.first().map(|s| s.to_string())))
             }
             "DRAIN" => Ok(Command::Drain),
+            "ROSTER" => {
+                let op = match args.first().map(|s| s.to_ascii_uppercase()).as_deref() {
+                    None | Some("LIST") => RosterOp::List,
+                    Some("ADD") => RosterOp::Add,
+                    Some("DEL") | Some("REMOVE") => RosterOp::Del,
+                    Some(other) => {
+                        return Err(format!("ROSTER: unknown op '{other}' (LIST, ADD, DEL)"))
+                    }
+                };
+                let target = match op {
+                    RosterOp::List => None,
+                    _ => Some(arg(1, "target")?.to_string()),
+                };
+                Ok(Command::Roster { op, target })
+            }
             "PART" => Ok(Command::Part {
                 channel: parse_channel(arg(0, "channel")?)?,
                 reason: trailing.map(str::to_string),
@@ -312,10 +343,17 @@ impl Command {
                 state,
                 vram_free_mb,
                 active_tasks,
-            } => format!(
-                "STATUS {agent} {} {vram_free_mb} {active_tasks}",
-                state.hex()
-            ),
+                status_text,
+            } => match status_text {
+                Some(t) => format!(
+                    "STATUS {agent} {} {vram_free_mb} {active_tasks} :{t}",
+                    state.hex()
+                ),
+                None => format!(
+                    "STATUS {agent} {} {vram_free_mb} {active_tasks}",
+                    state.hex()
+                ),
+            },
             Command::Join(c) => format!("JOIN {c}"),
             Command::Names(c) => format!("NAMES {c}"),
             Command::Auth(t) => format!("AUTH {t}"),
@@ -328,6 +366,12 @@ impl Command {
             Command::Who(Some(t)) => format!("WHO {t}"),
             Command::Who(None) => "WHO".to_string(),
             Command::Drain => "DRAIN".to_string(),
+            Command::Roster { op, target } => match (op, target) {
+                (RosterOp::List, _) => "ROSTER LIST".to_string(),
+                (RosterOp::Add, Some(t)) => format!("ROSTER ADD {t}"),
+                (RosterOp::Del, Some(t)) => format!("ROSTER DEL {t}"),
+                _ => "ROSTER".to_string(),
+            },
             Command::Part { channel, reason } => match reason {
                 Some(r) => format!("PART {channel} :{r}"),
                 None => format!("PART {channel}"),
@@ -508,6 +552,17 @@ mod tests {
             Command::List,
             Command::Who(Some("@pool:coder".into())),
             Command::Drain,
+            Command::Roster {
+                op: RosterOp::Add,
+                target: Some("#swarm".into()),
+            },
+            Command::Status {
+                agent: "ag_1".into(),
+                state: PresenceState::Away,
+                vram_free_mb: 0,
+                active_tasks: 0,
+                status_text: Some("rebuilding index".into()),
+            },
             Command::Ping(Some("tok".into())),
             Command::BinFrame {
                 target: "#swarm".into(),

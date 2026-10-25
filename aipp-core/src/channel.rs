@@ -11,6 +11,18 @@
 
 use std::collections::BTreeMap;
 
+/// Persisted channel state. Members are deliberately absent: a restart
+/// must not resurrect agents that are not connected.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ChannelState {
+    pub name: String,
+    pub moderated: bool,
+    pub invite_only: bool,
+    pub topic_locked: bool,
+    pub topic: Option<String>,
+    pub bans: Vec<String>,
+}
+
 /// Membership flags for one agent inside one channel.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Flags {
@@ -217,6 +229,41 @@ impl Registry {
             .get(channel)
             .map(|c| c.is_op(agent))
             .unwrap_or(false)
+    }
+
+    /// Recreate a channel from persistence without members: a restart must
+    /// not resurrect people who are not connected.
+    pub fn restore(
+        &mut self,
+        name: &str,
+        moderated: bool,
+        invite_only: bool,
+        topic_locked: bool,
+        topic: Option<String>,
+        bans: Vec<String>,
+    ) {
+        let mut c = Channel::new(name);
+        c.moderated = moderated;
+        c.invite_only = invite_only;
+        c.topic_locked = topic_locked;
+        c.topic = topic;
+        c.bans = bans.into_iter().collect();
+        self.channels.insert(name.to_string(), c);
+    }
+
+    /// Snapshot for persistence.
+    pub fn snapshot(&self) -> Vec<ChannelState> {
+        self.channels
+            .values()
+            .map(|c| ChannelState {
+                name: c.name.clone(),
+                moderated: c.moderated,
+                invite_only: c.invite_only,
+                topic_locked: c.topic_locked,
+                topic: c.topic.clone(),
+                bans: c.bans.iter().cloned().collect(),
+            })
+            .collect()
     }
 
     /// Set a channel flag (`+m`, `+i`, `+t`). Only operators do this; the

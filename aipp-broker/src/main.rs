@@ -77,6 +77,13 @@ impl Conn {
     }
 }
 
+/// One held message: who sent it, what it said, and when it expires.
+struct Stored {
+    at: Instant,
+    from: String,
+    text: String,
+}
+
 struct Broker {
     conns: BTreeMap<u64, Arc<Conn>>,
     agents: BTreeMap<String, AgentRecord>,
@@ -91,6 +98,12 @@ struct Broker {
     max_bytes_per_sec: u32,
     /// agents that asked to drain: no new tasks are dispatched to them
     draining: BTreeSet<String>,
+    /// STORE_FORWARD: messages held for an agent that is not connected
+    store: BTreeMap<String, Vec<Stored>>,
+    store_ttl: Duration,
+    store_max: usize,
+    /// channels survive a restart; connections never do
+    state_path: Option<PathBuf>,
 }
 
 impl Broker {
@@ -105,6 +118,110 @@ impl Broker {
             max_cmds_per_sec: 0,
             max_bytes_per_sec: 0,
             draining: BTreeSet::new(),
+            store: BTreeMap::new(),
+            store_ttl: Duration::from_secs(900),
+            store_max: 256,
+            state_path: None,
+        }
+    }
+
+    /// Hold a message for an agent that is not connected (the wire form is
+    /// the `STORE_FORWARD` TLV in the payload plane; here it is the
+    /// control-plane courtesy that keeps a dispatch from being lost).
+    fn store_for(&mut self, target: &str, from: &str, text: &str) -> usize {
+        let q = self.store.entry(target.to_string()).or_default();
+        q.push(Stored {
+            at: Instant::now(),
+            from: from.to_string(),
+            text: text.to_string(),
+        });
+        while q.len() > self.store_max {
+            q.remove(0);
+        }
+        self.store.get(target).map(|q| q.len()).unwrap_or(0)
+    }
+
+    /// Hand the backlog over at registration, then forget it.
+    fn drain_store(&mut self, agent: &str) -> Vec<(String, String)> {
+        self.store
+            .remove(agent)
+            .map(|q| {
+                q.into_iter()
+                    .filter(|m| m.at.elapsed() < self.store_ttl)
+                    .map(|m| (m.from, m.text))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn sweep_store(&mut self) -> usize {
+        let ttl = self.store_ttl;
+        let mut dropped = 0;
+        for q in self.store.values_mut() {
+            let before = q.len();
+            q.retain(|m| m.at.elapsed() < ttl);
+            dropped += before - q.len();
+        }
+        self.store.retain(|_, q| !q.is_empty());
+        dropped
+    }
+
+    fn save_state(&self) {
+        let Some(path) = &self.state_path else { return };
+        let chans: Vec<serde_json::Value> = self
+            .reg
+            .snapshot()
+            .into_iter()
+            .map(|c| {
+                json!({"name": c.name, "moderated": c.moderated,
+                       "invite_only": c.invite_only, "topic_locked": c.topic_locked,
+                       "topic": c.topic, "bans": c.bans})
+            })
+            .collect();
+        let doc = json!({"version": 1, "channels": chans});
+        let tmp = path.with_extension("tmp");
+        if std::fs::write(&tmp, doc.to_string()).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        }
+    }
+
+    fn load_state(&mut self) {
+        let Some(path) = &self.state_path else { return };
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text) else {
+            eprintln!("[aipp] state file {path:?} is not valid JSON; ignoring it");
+            return;
+        };
+        if let Some(chans) = doc.get("channels").and_then(|c| c.as_array()) {
+            for c in chans {
+                let name = c.get("name").and_then(|v| v.as_str()).unwrap_or_default();
+                if name.is_empty() {
+                    continue;
+                }
+                self.reg.restore(
+                    name,
+                    c.get("moderated")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                    c.get("invite_only")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                    c.get("topic_locked")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true),
+                    c.get("topic").and_then(|v| v.as_str()).map(str::to_string),
+                    c.get("bans")
+                        .and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|b| b.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                );
+            }
         }
     }
 
@@ -207,6 +324,7 @@ fn main() {
     let mut ttl_ms = 15_000u64;
     let mut log: Option<PathBuf> = None;
     let mut auth_key: Option<String> = None;
+    let mut state_path: Option<PathBuf> = None;
     let mut max_cmds_per_sec: u32 = 0;
     let mut max_bytes_per_sec: u32 = 0;
 
@@ -218,6 +336,7 @@ fn main() {
             "--ttl-ms" => ttl_ms = args.next().and_then(|p| p.parse().ok()).unwrap_or(ttl_ms),
             "--log" => log = args.next().map(PathBuf::from),
             "--auth-key" => auth_key = args.next(),
+            "--state" => state_path = args.next().map(PathBuf::from),
             "--max-cmds-per-sec" => {
                 max_cmds_per_sec = args.next().and_then(|p| p.parse().ok()).unwrap_or(0)
             }
@@ -252,6 +371,8 @@ fn main() {
     }
     broker_state.max_cmds_per_sec = max_cmds_per_sec;
     broker_state.max_bytes_per_sec = max_bytes_per_sec;
+    broker_state.state_path = state_path;
+    broker_state.load_state();
     let broker = Arc::new(Mutex::new(broker_state));
     let next_id = Arc::new(AtomicU64::new(1));
 
@@ -262,6 +383,10 @@ fn main() {
             std::thread::sleep(Duration::from_millis(200));
             let expired = {
                 let mut b = broker.lock().unwrap();
+                let dropped = b.sweep_store();
+                if dropped > 0 {
+                    b.journal("store_expired", json!({"dropped": dropped}));
+                }
                 b.sweep(Instant::now())
             };
             for name in expired {
@@ -464,6 +589,18 @@ fn handle_line(broker: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, line: &str) -> Res
             conn.send_line(&format!(
                 "ACK 001 :Welcome to the Agent Mesh Network, {nick}"
             ));
+            // store-and-forward: whatever was held while this agent was
+            // away is delivered now, before any new work
+            let backlog = {
+                let mut b = broker.lock().unwrap();
+                b.drain_store(&nick)
+            };
+            if !backlog.is_empty() {
+                conn.send_line(&format!("STORED_INBOX {nick} {}", backlog.len()));
+                for (from, text) in backlog {
+                    conn.send_line(&format!(":{from} PRIVMSG {nick} :{text}"));
+                }
+            }
         }
         Command::User { class, caps } => {
             let name = name_of(conn).unwrap();
@@ -535,6 +672,7 @@ fn handle_line(broker: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, line: &str) -> Res
                 names = b.reg.names(&chan).unwrap_or_default();
                 others = b.reg.members(&chan);
                 b.journal("join", json!({"ag_id": me, "channel": chan}));
+                b.save_state();
             }
             conn.send_line(&format!("JOINED {chan} {me}"));
             conn.send_line(&format!("NAMES {chan} :{names}"));
@@ -589,7 +727,7 @@ fn handle_line(broker: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, line: &str) -> Res
             let me = name_of(conn).unwrap();
             let recipients;
             {
-                let b = broker.lock().unwrap();
+                let mut b = broker.lock().unwrap();
                 // `@pool:<class>` is presence-aware: the broker picks a
                 // member of that class that is actually taking work
                 if is_pool(&target) {
@@ -634,9 +772,14 @@ fn handle_line(broker: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, line: &str) -> Res
                     reply_err(conn, 403, &format!("No such channel {target}"));
                     return Ok(());
                 }
-                if !target.starts_with('#') && !b.agents.contains_key(&target) {
+                // a direct message to an agent that is not connected is
+                // held, not lost: store-and-forward is the point of knowing
+                // an agent is OFFLINE
+                if !target.starts_with('#') && b.conn_of(&target).is_none() {
+                    let n = b.store_for(&target, &me, &text);
+                    b.journal("stored", json!({"from": me, "to": target, "queued": n}));
                     drop(b);
-                    reply_err(conn, 401, &format!("No such agent {target}"));
+                    conn.send_line(&format!("STORED {target} {n}"));
                     return Ok(());
                 }
                 b.journal(
@@ -820,6 +963,7 @@ fn handle_line(broker: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, line: &str) -> Res
                         "topic",
                         json!({"ag_id": me, "channel": channel, "topic": t}),
                     );
+                    b.save_state();
                     drop(b);
                     conn.send_line(&format!("TOPIC_SET {channel}"));
                     for m in members {

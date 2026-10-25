@@ -106,8 +106,11 @@ def main():
         # the mesh is at-most-once flooding without acks: the origin is told
         # the message entered the mesh, and a dead end drops it (journaled).
         # Claiming a delivery guarantee here would be the lie.
+        # the origin is told the message entered the mesh, with the id it
+        # can be acknowledged against
+        relayed = [l for l in got.split("\r\n") if l.startswith("RELAYED ")]
         check("federation: the origin is told the message entered the mesh",
-              "RELAYED nobody_here" in got, got[:120])
+              any("nobody_here" in l for l in relayed), got[:120])
 
         # a target that left before the message arrives: the relay reaches
         # the broker that last saw it, finds nobody, has no further links
@@ -119,8 +122,9 @@ def main():
         time.sleep(0.4)
         bob.sendall(b"PRIVMSG away_agent :too late\r\n")
         got = lines(bob)
+        relayed = [l for l in got.split("\r\n") if l.startswith("RELAYED ")]
         check("federation: an unknown target here is relayed, not refused",
-              "RELAYED away_agent" in got, got[:120])
+              any("away_agent" in l for l in relayed), got[:120])
         late = agent(B, "away_agent")
         got = lines(late, 2.0)
         check("federation: a dropped relay is not resurrected at registration",

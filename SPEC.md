@@ -299,18 +299,28 @@ RELAY <msg-id> <hops> <origin-broker> <sender> <target> :<text>
 ```
 
 * A direct message whose target is unknown locally is relayed to every
-  link; the origin is answered `RELAYED <target> <links>` — "entered the
-  mesh", not "delivered".
+  link; the origin is answered `RELAYED <msg-id> <target> <links>` —
+  "entered the mesh", not "delivered".
 * The relay is delivered when a broker knows the target, held by that
   broker's store-and-forward if the agent is registered but unreachable,
   or forwarded onward otherwise.
 * **Loop safety is structural**: flooding is deduped by `msg-id` (each
   broker keeps a bounded seen-set) and bounded by `hops` (8). A relay
   that arrives at its origin broker is dropped.
-* **Delivery guarantee: none.** Flooding without acknowledgements is
-  at-most-once *at best*. A relay that reaches a broker which does not
-  know the target and has no further links is dropped and journaled.
-  Any claim of guaranteed delivery would be false.
+* **Delivery acknowledgement.** A broker that accepts a relay for local
+  delivery or holding answers `RELAY_ACK <msg-id>` along the reverse
+  path it was received on; each intermediate broker forwards the ack the
+  same way. When the ack reaches the origin, the local sender is told
+  `DELIVERED <msg-id>`. This upgrades relayed messages to
+  **at-least-once** (the dedup by `msg-id` makes replays safe); a relay
+  that dies at a dead end is never acknowledged — the honest signal of
+  loss.
+* **Directory search.** `FIND <query>` matches local agents by ag-id,
+  class and status text (case-insensitive substring) and is flooded like
+  a relay (`FIND_RELAY`, same dedup and hop bound); matches come back
+  along the reverse path as `FOUND <ag-id> <class> <state> :<status
+  text>`. Results arrive asynchronously after the local `FIND_DONE
+  <msg-id>`.
 * Channel fan-out is local in v1.0: `#channels` do not cross links, and
   a relayed channel message is dropped rather than half-delivered.
 * Link peers are trusted by address; there is no broker authentication.

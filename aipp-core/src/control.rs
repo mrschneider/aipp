@@ -421,7 +421,7 @@ impl Command {
                     (PrivacyOp::List, _) => format!("{l} LIST"),
                     (PrivacyOp::Add, Some(t)) => format!("{l} ADD {t}"),
                     (PrivacyOp::Del, Some(t)) => format!("{l} DEL {t}"),
-                    _ => format!("{l}"),
+                    _ => l.to_string(),
                 }
             }
             Command::Roster { op, target } => match (op, target) {

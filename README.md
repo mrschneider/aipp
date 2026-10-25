@@ -35,13 +35,19 @@ vector in this repository. Nothing is claimed without its test.
   an unannounced frame refused (`ERR 412`).
 
 ### Presence engine (the ICQ half)
-* Five states — `ONLINE 0x00`, `BUSY 0x01`, `HIGH_LOAD 0x02`,
-  `AWAY 0x03`, `OFFLINE 0x04` — carried with `vram_free_mb` and
-  `active_tasks`.
+* Six states — `ONLINE 0x00`, `BUSY 0x01`, `HIGH_LOAD 0x02`,
+  `AWAY 0x03`, `OFFLINE 0x04`, `DND 0x05` — carried with `vram_free_mb`
+  and `active_tasks`.
+* **`DND` is its own state**: not even critical work — stronger than
+  `HIGH_LOAD`, which still accepts what matters. A `DND` agent is
+  skipped by pool dispatch.
+* **The away message rides the state**: `STATUS ag_1 0x05 0 0 :rebuilding
+  the index` — the *why* behind the state, broadcast with the vector, so
+  an orchestrator reads the reason instead of guessing.
 * **Presence TTL is enforced by the broker**: an agent that stops
   responding is announced gone — `QUIT <ag-id> :Heartbeat timeout` — a
   wedged agent cannot lie by staying quiet.
-* Presence-aware dispatch: `PRIVMSG @pool:<class>` picks a member of
+* **Presence-aware dispatch**: `PRIVMSG @pool:<class>` picks a member of
   that class that accepts tasks and is not draining, lowest
   `active_tasks` first.
 * **`DRAIN`**: an agent leaves dispatch, moves to `AWAY`, finishes what
@@ -50,6 +56,26 @@ vector in this repository. Nothing is claimed without its test.
   `ERR 509` instead of parking the broker. The broker never blocks on a
   slow peer: every connection has a bounded `Outbox` with its own writer
   thread.
+
+### The social layer (ICQ's other lesson)
+* **Server-side roster** — `ROSTER ADD/DEL/LIST`, persisted in the state
+  file, inherited at registration: an agent that comes back online gets
+  its social context back instead of rebuilding it by naming convention.
+  A roster subscriber receives the watched agent's presence *without
+  sharing a channel* — that is what "following" means — and a
+  subscription to an agent on another broker is registered on the broker
+  that hosts it.
+* **Privacy lists** — `IGNORE` always wins: an ignored sender is refused
+  with `ERR 486`, named, and stops receiving the agent's presence
+  broadcasts. A non-empty `PERMIT` list is allow-list mode: a sender not
+  on it is refused with `ERR 487`. Both persist.
+* **Typing events** — `TYPING <target>` is relayed like a message, so a
+  producer announces the stream before the tokens arrive.
+* **Directory search** — `FIND <query>` matches agents by ag-id, class
+  and status text (case-insensitive substring), floods across the
+  federation like a relay, and the matches come back along the reverse
+  path as `FOUND <ag-id> <class> <state> :<status text>`. The whitepages,
+  for agents.
 
 ### Channels (the IRC half)
 * `JOIN`/`PART`/`NAMES`/`PRIVMSG`/`NOTICE`, first joiner is `+o`.
@@ -90,14 +116,21 @@ vector in this repository. Nothing is claimed without its test.
 Brokers link and agents reach each other across links (`--peer`,
 `--id`):
 
-* The link speaks AIPP itself with two link-only commands
-  (`FEDERATE`/`FEDERATED`, `RELAY`) intercepted **before** the agent
-  grammar, so an agent cannot forge them.
+* The link speaks AIPP itself with link-only commands
+  (`FEDERATE`/`FEDERATED`, `RELAY`, `RELAY_ACK`, `FIND_RELAY`,
+  `FOUND_RELAY`, `ROSTER_SUB`, `PRESENCE_RELAY`) intercepted **before**
+  the agent grammar, so an agent cannot forge them.
+* **Delivery acknowledgement**: a broker that accepts a relay — delivers
+  it or holds it — answers `RELAY_ACK <msg-id>` along the reverse path
+  it was received on; intermediates forward the ack the same way; when
+  it reaches the origin the local sender is told `DELIVERED <msg-id>`.
+  Relayed messages are therefore **at-least-once** (dedup by `msg-id`
+  makes replays safe). A relay that dies at a dead end is never
+  acknowledged — the honest signal of loss, not a fake delivery.
 * Flooding deduped by message id and bounded by 8 hops; a relay that
   arrives at its origin is dropped — A↔B↔C cannot loop.
-* The origin is told `RELAYED <target> <links>` — "entered the mesh",
-  not "delivered". **Flooding without acks is at-most-once at best**;
-  the experiment asserts the loss instead of hiding it.
+* The origin is first told `RELAYED <msg-id> <target> <links>` —
+  "entered the mesh", not "delivered".
 * A target known-but-unreachable on the receiving broker is held by that
   broker's store-and-forward — federation and the backlog compose.
 * Channel fan-out stays local in v1.0: a relayed channel message is
@@ -114,11 +147,17 @@ Brokers link and agents reach each other across links (`--peer`,
   it — which is also what bounds a slowloris.
 
 ### Operations
-* `--state <path>`: channel snapshot (flags, topic, bans) written
-  atomically on every mutation and reloaded at boot. **Members are
-  deliberately not persisted** — a restart must not resurrect agents
-  that are not connected.
+* `--state <path>`: channel snapshot **and per-agent rosters and privacy
+  lists** written atomically on every mutation and reloaded at boot.
+  **Members are deliberately not persisted** — a restart must not
+  resurrect agents that are not connected.
 * JSONL journal of every decision, hash-chained.
+* GitHub Actions: CI runs fmt, clippy `-D warnings`, all 44 tests and
+  the five end-to-end experiments on real sockets; the release workflow
+  re-runs the whole gate before packaging `aipp-broker` for
+  x86_64 (gnu and musl) with sha256 sums. Dependabot keeps actions and
+  Rust deps current (coordinated bumps when two crates must move
+  together).
 
 ## Conformance
 
@@ -138,7 +177,8 @@ announced 4 GiB payload is refused without allocation.
 ## Verified results
 
 **`cargo test --workspace` → 44 tests** (unit + conformance + hostile
-input), `clippy -D warnings` and `cargo fmt --check` clean.
+input), `clippy -D warnings` and `cargo fmt --check` clean. CI is green
+on `main`.
 
 **`experiments/experiment_001_dual_plane.py` → 18/18 PASS** — four real
 agents on a real broker: identification, presence broadcast, channel
@@ -164,9 +204,19 @@ plaintext client.
 brokers in a chain (C → A → B, no direct C–B link): a message crosses
 the link with the sender attributed, the reply crosses back with no
 route table, a two-hop message reaches the far broker, flooding neither
-duplicates nor loops, an unknown target everywhere is relayed (and its
-loss is asserted, not hidden), and a stored message is not resurrected
-at registration.
+duplicates nor loops, the origin is told the message entered the mesh
+(with the id it is later acknowledged against), an unknown target
+everywhere is relayed — and its loss is asserted, not hidden — and a
+dropped relay is not resurrected at registration.
+
+**`experiments/experiment_005_icq.py` → 11/11 PASS** — the away message
+rides the presence broadcast, DND is its own state and is skipped by
+pool dispatch, the roster survives a broker restart, an ignored sender
+is refused and named, a sender outside the permit list is refused, a
+permitted sender is delivered, the typing event is relayed, the origin
+learns the delivery id and the `DELIVERED` ack across two hops, a
+directory search crosses brokers, and the link handshake answers once
+(no echo loop).
 
 ## Layout
 
@@ -176,10 +226,11 @@ aipp-core/      the contract, no IO: control grammar (canonical forms),
                 control (Outbox, CreditWindow), identity (AUTH, caps,
                 rate limit, audit chain)
 aipp-broker/    the edge broker: registration, presence TTL, channels,
-                dual-plane multiplexing, pools, drain, store-and-forward,
-                persistence, TLS, federation
+                dual-plane multiplexing, pools, drain, roster, privacy
+                lists, store-and-forward, persistence, TLS, federation
+                (relay, acks, directory)
 conformance/    byte-level vectors (normative)
-experiments/    4 end-to-end proofs, Python peers on purpose: the point
+experiments/    5 end-to-end proofs, Python peers on purpose: the point
                 is cross-runtime interop
 SPEC.md         the normative document
 ```
@@ -192,8 +243,8 @@ cargo build --release
 # broker, open mode (debugging)
 ./target/release/aipp-broker --port 7911 --ttl-ms 15000
 
-# broker, authenticated, with a persistent channel state
-./target/release/aipp-broker --port 7912 --auth-key <shared-secret> --state channels.json
+# broker, authenticated, with persistent channels/rosters/privacy lists
+./target/release/aipp-broker --port 7912 --auth-key <shared-secret> --state aipp.json
 
 # broker with TLS
 openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem \
@@ -205,19 +256,24 @@ openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem \
 ./target/release/aipp-broker --port 7915 --id spoke-1 --peer 127.0.0.1:7914
 
 # then, from a shell, an agent is just:
-#   printf 'NICK ag_1\r\nUSER coder 0x1f\r\nSTATUS ag_1 0x00 0 0\r\n' | nc localhost 7911
+#   printf 'NICK ag_1\r\nUSER coder 0x1f\r\nSTATUS ag_1 0x00 0 0 :ready\r\n' | nc localhost 7911
 ```
 
 ## Deliberately not implemented
 
 Stated, not implied:
 
-* **Delivery guarantees across the mesh** — flooding without acks is
-  at-most-once at best; see SPEC §13.
+* **Delivery guarantees across the whole mesh** — the ack upgrade makes
+  relayed messages at-least-once, but a dead end still loses the message
+  silently at the origin's edge; end-to-end acks from the *agent* (not
+  the broker) are the next step and are not written.
 * **Channel fan-out across brokers** — `#channels` are local in v1.0.
 * **Broker authentication** — link peers are trusted by address.
-* **Per-frame read deadlines configurable per deployment** — the reader
-  uses a fixed 100 ms timeout today.
+* **Transfer of large artifacts (P2P/file transfer)** — the ICQ direct
+  connection with chunked, resumable transfer is designed, not written;
+  `FIND` and the relay are its prerequisites and both exist.
+* **Configurable per-frame read deadlines** — the reader uses a fixed
+  100 ms timeout today.
 * **Outbound compression** — the TLV space has room for it; nothing is
   claimed until it is measured.
 * **cargo-fuzz targets** — the hostile-input stress test is a
@@ -228,7 +284,7 @@ Stated, not implied:
 | Version | What landed |
 |---|---|
 | **v0.5.0** | the ICQ feature set: delivery acks across the mesh (at-least-once), DND + away message, server-side roster, privacy lists (permit/ignore), typing events, federated directory search |
-| **v0.4.0** | store-and-forward, channel persistence, TLS on both planes, federation |
+| v0.4.0 | store-and-forward, channel persistence, TLS on both planes, federation |
 | v0.3.0 | identity (AUTH + capabilities), backpressure (Outbox), presence-aware dispatch (`@pool`, `DRAIN`), full channel modes, TLV fragmentation, rate limiting, audit chain |
 | v0.2.0 | dual-plane E2E proof, broker, presence TTL, JSONL journal |
 | v0.1.0 | core: control grammar, presence, channels, TLV codec |

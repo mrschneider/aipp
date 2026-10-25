@@ -453,7 +453,8 @@ mod tests {
                 agent: "builder_agent".into(),
                 state: PresenceState::Online,
                 vram_free_mb: 61440,
-                active_tasks: 0
+                active_tasks: 0,
+                status_text: None,
             }
         );
         assert_eq!(
@@ -514,6 +515,7 @@ mod tests {
                 state: PresenceState::Busy,
                 vram_free_mb: 32768,
                 active_tasks: 2,
+                status_text: None,
             },
             Command::Join("#swarm".into()),
             Command::Part {

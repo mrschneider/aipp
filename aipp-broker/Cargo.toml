@@ -1,0 +1,16 @@
+[package]
+name = "aipp-broker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "AIPP edge broker: channels, presence TTL, dual-plane multiplexing"
+
+[[bin]]
+name = "aipp-broker"
+path = "src/main.rs"
+
+[dependencies]
+aipp-core = { workspace = true }
+serde_json = { workspace = true }

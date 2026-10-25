@@ -28,6 +28,9 @@ pub enum PresenceState {
     HighLoad = 0x02,
     Away = 0x03,
     Offline = 0x04,
+    /// do not disturb: not even critical work. Stronger than HIGH_LOAD,
+    /// which still accepts what matters.
+    Dnd = 0x05,
 }
 
 impl PresenceState {
@@ -38,6 +41,7 @@ impl PresenceState {
             0x02 => Some(Self::HighLoad),
             0x03 => Some(Self::Away),
             0x04 => Some(Self::Offline),
+            0x05 => Some(Self::Dnd),
             _ => None,
         }
     }
@@ -66,6 +70,7 @@ impl PresenceState {
             Self::HighLoad => "0x02",
             Self::Away => "0x03",
             Self::Offline => "0x04",
+            Self::Dnd => "0x05",
         }
     }
 
@@ -76,6 +81,7 @@ impl PresenceState {
             Self::HighLoad => "HIGH_LOAD",
             Self::Away => "AWAY",
             Self::Offline => "OFFLINE",
+            Self::Dnd => "DND",
         }
     }
 
@@ -84,6 +90,11 @@ impl PresenceState {
     /// it is queueing.
     pub fn accepts_tasks(self) -> bool {
         matches!(self, Self::Online | Self::Busy)
+    }
+
+    /// The states an orchestrator should not bother at all.
+    pub fn refuses_all_work(self) -> bool {
+        matches!(self, Self::Dnd | Self::Offline)
     }
 
     /// Should an orchestrator stop sending non-critical work?
@@ -109,6 +120,9 @@ pub struct AgentRecord {
     pub active_tasks: u32,
     /// Last control-plane evidence of life (any command refreshes it).
     pub last_seen: Instant,
+    /// The away/status message: the *why* behind the state, the thing
+    /// ICQ taught us an orchestrator actually reads.
+    pub status_text: Option<String>,
 }
 
 impl AgentRecord {
@@ -121,6 +135,7 @@ impl AgentRecord {
             vram_free_mb: 0,
             active_tasks: 0,
             last_seen: Instant::now(),
+            status_text: None,
         }
     }
 
@@ -144,13 +159,23 @@ impl AgentRecord {
 
     /// The presence vector as it goes on the wire.
     pub fn status_line(&self) -> String {
-        format!(
-            "STATUS {} {} {} {}",
-            self.ag_id,
-            self.state.hex(),
-            self.vram_free_mb,
-            self.active_tasks
-        )
+        match &self.status_text {
+            Some(t) => format!(
+                "STATUS {} {} {} {} :{}",
+                self.ag_id,
+                self.state.hex(),
+                self.vram_free_mb,
+                self.active_tasks,
+                t
+            ),
+            None => format!(
+                "STATUS {} {} {} {}",
+                self.ag_id,
+                self.state.hex(),
+                self.vram_free_mb,
+                self.active_tasks
+            ),
+        }
     }
 
     /// Human-readable form for `NAMES`/diagnostics.
@@ -190,6 +215,13 @@ mod tests {
         let mut a = AgentRecord::new("ag_alpha_09", "coder-specialist", 0x0F);
         a.set_status(PresenceState::Busy, 32768, 2);
         assert_eq!(a.status_line(), "STATUS ag_alpha_09 0x01 32768 2");
+        a.status_text = Some("running the eval suite".into());
+        assert_eq!(
+            a.status_line(),
+            "STATUS ag_alpha_09 0x01 32768 2 :running the eval suite"
+        );
+        let dnd = AgentRecord::new("ag_2", "coder", 0);
+        assert!(!dnd.state.refuses_all_work(), "fresh agent is reachable");
     }
 
     #[test]

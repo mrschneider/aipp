@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Tests (unit, conformance vectors, hostile input)
+        run: cargo test --workspace
+
+  experiments:
+    runs-on: ubuntu-latest
+    needs: checks
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --workspace
+      - name: Dual-plane E2E
+        run: python3 experiments/experiment_001_dual_plane.py
+      - name: Hardening E2E
+        run: python3 experiments/experiment_002_hardening.py
+      - name: TLS E2E
+        run: python3 experiments/experiment_003_tls.py
+      - name: Federation E2E
+        run: python3 experiments/experiment_004_federation.py

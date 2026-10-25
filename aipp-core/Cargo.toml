@@ -10,3 +10,6 @@ description = "AIPP — Agentic Internet & Presence Protocol: dual-plane framing
 [dependencies]
 hmac = { workspace = true }
 sha2 = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

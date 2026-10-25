@@ -21,6 +21,7 @@ use aipp_core::control::Command;
 use aipp_core::flow::{FlowError, Outbox};
 use aipp_core::presence::AgentRecord;
 use aipp_core::security::{cap, Authority, Identity, RateLimiter};
+use aipp_core::tlv::Reassembler;
 use aipp_core::tlv::{tlv_label, Frame};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
@@ -58,6 +59,8 @@ struct Conn {
     /// advertised capabilities from `USER`
     caps: Mutex<u32>,
     limiter: Mutex<RateLimiter>,
+    /// fragments arriving for one announced (large) frame
+    reasm: Mutex<Reassembler>,
 }
 
 impl Conn {
@@ -457,6 +460,7 @@ fn main() {
             identity: Mutex::new(None),
             caps: Mutex::new(0),
             limiter: Mutex::new(RateLimiter::new(limits.0, limits.1)),
+            reasm: Mutex::new(Reassembler::new()),
         });
         {
             let mut b = broker.lock().unwrap();
@@ -1277,6 +1281,24 @@ fn handle_line(broker: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, line: &str) -> Res
 }
 
 fn handle_frame(broker: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, frame: Frame) -> Result<(), ()> {
+    // a fragment belongs to the announcement already open on this
+    // connection: collect it, and only when the whole set is in does the
+    // frame become the one the sender meant
+    let frame = if frame.tlv_type == aipp_core::tlv::tlv_type::FRAGMENT {
+        let done = { conn.reasm.lock().unwrap().push(&frame) };
+        match done {
+            Some((id, inner, payload)) => {
+                conn.send_line(&format!("FRAG_ACK {id} :complete"));
+                Frame::new(inner, payload)
+            }
+            None => {
+                conn.send_line("FRAG_ACK :partial");
+                return Ok(());
+            }
+        }
+    } else {
+        frame
+    };
     let me = match name_of(conn) {
         Some(n) => n,
         None => {
@@ -1311,9 +1333,26 @@ fn handle_frame(broker: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, frame: Frame) -> 
         );
         recipients = b.targets(&p.target, &me);
     }
-    let wire = frame.encode();
-    for c in &recipients {
-        c.send_bytes(&wire);
+    // outbound fragmentation: a frame larger than MAX_FRAGMENT is split,
+    // because a single huge frame is a single huge allocation at the peer
+    if frame.payload.len() > aipp_core::tlv::MAX_FRAGMENT {
+        let bundle = conn.id as u32;
+        for frag in aipp_core::tlv::fragment_payload(
+            bundle,
+            frame.tlv_type,
+            &frame.payload,
+            aipp_core::tlv::MAX_FRAGMENT,
+        ) {
+            let wire = frag.encode();
+            for c in &recipients {
+                c.send_bytes(&wire);
+            }
+        }
+    } else {
+        let wire = frame.encode();
+        for c in &recipients {
+            c.send_bytes(&wire);
+        }
     }
     conn.send_line(&format!("BIN_ACK {} {}", p.target, p.length));
     Ok(())

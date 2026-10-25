@@ -216,7 +216,7 @@ impl Frame {
 /// index, total) then the chunk. Reassembly is by bundle id, and an
 /// incomplete set is never delivered — the same rule as GAIP's GIOP
 /// fragments, because a half message is worse than none.
-pub fn fragment_payload(bundle_id: u32, payload: &[u8], max: usize) -> Vec<Frame> {
+pub fn fragment_payload(bundle_id: u32, inner: u16, payload: &[u8], max: usize) -> Vec<Frame> {
     let max = max.clamp(64, MAX_FRAGMENT);
     let chunks: Vec<&[u8]> = payload.chunks(max).collect();
     let total = chunks.len().max(1) as u16;
@@ -224,8 +224,11 @@ pub fn fragment_payload(bundle_id: u32, payload: &[u8], max: usize) -> Vec<Frame
         .into_iter()
         .enumerate()
         .map(|(i, chunk)| {
-            let mut body = Vec::with_capacity(6 + chunk.len());
+            let mut body = Vec::with_capacity(10 + chunk.len());
             body.extend_from_slice(&bundle_id.to_be_bytes());
+            // the original TLV type rides in the bundle, so reassembly can
+            // hand back the frame the sender meant, not a FRAGMENT
+            body.extend_from_slice(&inner.to_be_bytes());
             body.extend_from_slice(&(i as u16).to_be_bytes());
             body.extend_from_slice(&total.to_be_bytes());
             body.extend_from_slice(chunk);
@@ -250,8 +253,8 @@ impl Reassembler {
 
     /// Feed one fragment. Returns the whole payload once every fragment
     /// of that bundle has arrived.
-    pub fn push(&mut self, frame: &Frame) -> Option<(u32, Vec<u8>)> {
-        if frame.tlv_type != tlv_type::FRAGMENT || frame.payload.len() < 6 {
+    pub fn push(&mut self, frame: &Frame) -> Option<(u32, u16, Vec<u8>)> {
+        if frame.tlv_type != tlv_type::FRAGMENT || frame.payload.len() < 10 {
             return None;
         }
         let id = u32::from_be_bytes([
@@ -260,15 +263,16 @@ impl Reassembler {
             frame.payload[2],
             frame.payload[3],
         ]);
-        let index = u16::from_be_bytes([frame.payload[4], frame.payload[5]]) as usize;
+        let inner = u16::from_be_bytes([frame.payload[4], frame.payload[5]]);
+        let index = u16::from_be_bytes([frame.payload[6], frame.payload[7]]) as usize;
         // total lives in the chunk header for the first fragment only in
         // some encodings; here every fragment carries it in bytes 4..6 of
         // the body prefix, so parse it from the third field
         let total = u16::from_be_bytes([
-            frame.payload.get(6).copied().unwrap_or(0),
-            frame.payload.get(7).copied().unwrap_or(0),
+            frame.payload.get(8).copied().unwrap_or(0),
+            frame.payload.get(9).copied().unwrap_or(0),
         ]) as usize;
-        let chunk = frame.payload.get(8..)?.to_vec();
+        let chunk = frame.payload.get(10..)?.to_vec();
         if total == 0 || index >= total {
             return None;
         }
@@ -280,7 +284,7 @@ impl Reassembler {
         if entry.1.iter().all(|p| p.is_some()) {
             let (_, parts) = self.partial.remove(&id)?;
             let joined: Vec<u8> = parts.into_iter().flatten().flatten().collect();
-            return Some((id, joined));
+            return Some((id, inner, joined));
         }
         None
     }
@@ -390,7 +394,7 @@ mod tests {
     #[test]
     fn a_large_payload_fragments_and_reassembles() {
         let payload: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
-        let frames = fragment_payload(7, &payload, 512);
+        let frames = fragment_payload(7, tlv_type::JSON_TOOL, &payload, 512);
         assert!(frames.len() > 8, "5000 B at 512/frag -> {}", frames.len());
         let mut r = Reassembler::new();
         let mut out = None;
@@ -399,8 +403,13 @@ mod tests {
                 out = Some(done);
             }
         }
-        let (id, joined) = out.expect("a complete set must reassemble");
+        let (id, inner, joined) = out.expect("a complete set must reassemble");
         assert_eq!(id, 7);
+        assert_eq!(
+            inner,
+            tlv_type::JSON_TOOL,
+            "the original type survives the split"
+        );
         assert_eq!(joined, payload);
         assert_eq!(r.pending(), 0);
     }
@@ -408,7 +417,7 @@ mod tests {
     #[test]
     fn an_incomplete_set_is_never_delivered() {
         let payload: Vec<u8> = vec![9u8; 2000];
-        let mut frames = fragment_payload(1, &payload, 256);
+        let mut frames = fragment_payload(1, tlv_type::JSON_TOOL, &payload, 256);
         frames.pop();
         let mut r = Reassembler::new();
         for f in &frames {

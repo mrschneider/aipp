@@ -1,0 +1,161 @@
+{
+  "version": 1,
+  "note": "Byte-level conformance vectors: an implementation that passes these agrees with AIPP 1.0 on the wire. A line is the UTF-8 command without CRLF.",
+  "lines_ok": [
+    {
+      "in": "NICK builder_agent",
+      "canonical": "NICK builder_agent"
+    },
+    {
+      "in": "USER coder-specialist 15",
+      "canonical": "USER coder-specialist 0x0F"
+    },
+    {
+      "in": "STATUS ag_alpha_09 0x01 32768 2",
+      "canonical": "STATUS ag_alpha_09 0x01 32768 2"
+    },
+    {
+      "in": "JOIN #code-review",
+      "canonical": "JOIN #code-review"
+    },
+    {
+      "in": "PART #code-review :Task completed successfully",
+      "canonical": "PART #code-review :Task completed successfully"
+    },
+    {
+      "in": "PRIVMSG #code-review :Refactoring module auth.rs",
+      "canonical": "PRIVMSG #code-review :Refactoring module auth.rs"
+    },
+    {
+      "in": "NOTICE #system :[WARN] GPU temperature exceeds 85C",
+      "canonical": "NOTICE #system :[WARN] GPU temperature exceeds 85C"
+    },
+    {
+      "in": "MODE #code-review +o supervisor_agent",
+      "canonical": "MODE #code-review +o supervisor_agent"
+    },
+    {
+      "in": "MODE #code-review +m",
+      "canonical": "MODE #code-review +m"
+    },
+    {
+      "in": "KICK #code-review rogue_agent :Infinite loop detected",
+      "canonical": "KICK #code-review rogue_agent :Infinite loop detected"
+    },
+    {
+      "in": "NAMES #code-review",
+      "canonical": "NAMES #code-review"
+    },
+    {
+      "in": "PING :keepalive",
+      "canonical": "PING :keepalive"
+    },
+    {
+      "in": "PING keepalive",
+      "canonical": "PING :keepalive"
+    },
+    {
+      "in": "CAP LS",
+      "canonical": "CAP LS"
+    },
+    {
+      "in": "TOPIC #code-review :migration window",
+      "canonical": "TOPIC #code-review :migration window"
+    },
+    {
+      "in": "WHO @pool:coder",
+      "canonical": "WHO @pool:coder"
+    },
+    {
+      "in": "DRAIN",
+      "canonical": "DRAIN"
+    },
+    {
+      "in": "LIST",
+      "canonical": "LIST"
+    },
+    {
+      "in": "AUTH worker_1.1700000000000.1f.deadbeef",
+      "canonical": "AUTH worker_1.1700000000000.1f.deadbeef"
+    },
+    {
+      "in": "BIN_FRAME #code-review 0x0002 34",
+      "canonical": "BIN_FRAME #code-review 0x0002 34"
+    },
+    {
+      "in": "QUIT :bye",
+      "canonical": "QUIT :bye"
+    }
+  ],
+  "lines_bad": [
+    {
+      "in": "",
+      "error_contains": "empty command"
+    },
+    {
+      "in": "BOGUS #c",
+      "error_contains": "unknown command"
+    },
+    {
+      "in": "STATUS ag_1 0x09 100 0",
+      "error_contains": "unknown presence state"
+    },
+    {
+      "in": "MODE #c o ag",
+      "error_contains": "must start with"
+    },
+    {
+      "in": "MODE #c +x ag",
+      "error_contains": "unsupported flag"
+    },
+    {
+      "in": "MODE #c +ov ag",
+      "error_contains": "one flag per command"
+    },
+    {
+      "in": "JOIN code-review",
+      "error_contains": "channel names start with"
+    },
+    {
+      "in": "PRIVMSG #c hello",
+      "error_contains": "missing ':text'"
+    },
+    {
+      "in": "BIN_FRAME #c 0xZZ 10",
+      "error_contains": "invalid tlv type"
+    },
+    {
+      "in": "BIN_FRAME #c 0x0002 abc",
+      "error_contains": "length must be a number"
+    },
+    {
+      "in": "STATUS ag_1 0x01",
+      "error_contains": "vram_free_mb"
+    },
+    {
+      "in": "AUTH",
+      "error_contains": "token"
+    },
+    {
+      "in": "WHO @pool:",
+      "error_contains": "pool"
+    }
+  ],
+  "frames": [
+    {
+      "tlv_type": 2,
+      "payload_hex": "7b2261223a317d",
+      "label": "JSON-control"
+    },
+    {
+      "tlv_type": 3,
+      "payload_hex": "",
+      "label": "empty-payload"
+    },
+    {
+      "tlv_type": 5,
+      "payload_hex": "00ff00ff",
+      "label": "store-forward"
+    }
+  ]
+}

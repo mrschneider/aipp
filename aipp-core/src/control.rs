@@ -200,7 +200,15 @@ impl Command {
                 topic: trailing.map(str::to_string),
             }),
             "LIST" => Ok(Command::List),
-            "WHO" => Ok(Command::Who(args.first().map(|s| s.to_string()))),
+            "WHO" => {
+                // a bare "@pool:" is a malformed target, not "everything"
+                if let Some(t) = args.first() {
+                    if t.starts_with('@') {
+                        parse_target(t).map_err(|e| format!("WHO: {e}"))?;
+                    }
+                }
+                Ok(Command::Who(args.first().map(|s| s.to_string())))
+            }
             "DRAIN" => Ok(Command::Drain),
             "PART" => Ok(Command::Part {
                 channel: parse_channel(arg(0, "channel")?)?,
@@ -332,8 +340,15 @@ impl Command {
                 on,
                 target,
             } => format!(
-                "MODE {channel} {}{flag} {target}",
-                if *on { '+' } else { '-' }
+                // a channel flag has no target: emitting a trailing space
+                // would make the canonical form differ from itself
+                "MODE {channel} {sign}{flag}{tail}",
+                sign = if *on { '+' } else { '-' },
+                tail = if target.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {target}")
+                }
             ),
             Command::Kick {
                 channel,

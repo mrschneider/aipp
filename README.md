@@ -1,190 +1,236 @@
-# AIPP
+# AIPP — Agentic Internet & Presence Protocol
+
+**A high-performance, dual-plane wire protocol for multi-agent systems.**
+
+AIPP synthesizes IRC's decentralized pub/sub channel routing with ICQ's
+stateful, presence-driven framing: a human-readable control plane an
+operator can inspect with `nc`, and a binary TLV payload plane for
+embeddings and tool JSON on the same persistent connection.
 
 > **The normative document is [SPEC.md](SPEC.md).** This README describes
 > the reference implementation; where the two disagree, the spec wins and
-> the code is wrong. — Agentic Internet & Presence Protocol
+> the code is wrong. A Rust crate is a reference implementation, not a
+> definition.
 
-**IRC's channels for routing. ICQ's presence for scheduling. One socket for both.**
+**Why not REST or gRPC for everything?** Because agents are long-lived
+stateful nodes, not request handlers. An agent has a presence vector, a
+heartbeat TTL the *server* enforces, and membership in ephemeral
+collaboration spaces. You cannot express "this agent is BUSY, shed
+non-critical load" in a request/response API without inventing a second
+protocol — which is exactly what AIPP is.
 
-AIPP is a dual-plane wire protocol for multi-agent systems. It takes the
-two ideas that actually survived thirty years of network programming and
-puts them on one persistent connection:
+---
 
-| Plane | Model | Carries | Why |
-|---|---|---|---|
-| **Control** | IRC | `JOIN`, `PRIVMSG`, `STATUS`, `MODE`, `KICK` — CRLF ASCII | `telnet` and `grep` are real debugging tools for an agent fleet |
-| **Payload** | ICQ / OSCAR | binary TLV frames: JSON tool calls, embeddings, checkpoints | 16 KiB of float32 must not become 40 KiB of decimal digits |
+## What is implemented
+
+Every claim below is proved by a runnable experiment or a byte-level
+vector in this repository. Nothing is claimed without its test.
+
+### Dual-plane framing
+* Control plane: UTF-8 lines, CRLF-terminated, telnet-able by design.
+* Payload plane: 12-byte TLV frames (magic `0x41`, version `0x01`,
+  frame type, length, TLV type, reserved) multiplexed on the same socket.
+* Demultiplexing is by magic bytes; frames MUST be announced with
+  `BIN_FRAME <target> <tlv> <len>` and a mismatch is refused (`ERR 409`),
+  an unannounced frame refused (`ERR 412`).
+
+### Presence engine (the ICQ half)
+* Five states — `ONLINE 0x00`, `BUSY 0x01`, `HIGH_LOAD 0x02`,
+  `AWAY 0x03`, `OFFLINE 0x04` — carried with `vram_free_mb` and
+  `active_tasks`.
+* **Presence TTL is enforced by the broker**: an agent that stops
+  responding is announced gone — `QUIT <ag-id> :Heartbeat timeout` — a
+  wedged agent cannot lie by staying quiet.
+* Presence-aware dispatch: `PRIVMSG @pool:<class>` picks a member of
+  that class that accepts tasks and is not draining, lowest
+  `active_tasks` first.
+* **`DRAIN`**: an agent leaves dispatch, moves to `AWAY`, finishes what
+  it has. A draining agent receives no new pool work.
+* **Backpressure as protocol**: a peer that is not reading gets
+  `ERR 509` instead of parking the broker. The broker never blocks on a
+  slow peer: every connection has a bounded `Outbox` with its own writer
+  thread.
+
+### Channels (the IRC half)
+* `JOIN`/`PART`/`NAMES`/`PRIVMSG`/`NOTICE`, first joiner is `+o`.
+* Modes that mean something: `+m` (only ops and voiced may speak — this
+  is what gives `+v` its meaning), `+i` (invite-only), `+t`
+  (topic-locked), bans, invites.
+* `TOPIC`, `LIST`, `WHO` (per channel, per pool, or the whole mesh) as
+  operator views, gated by the `INSPECT` capability.
+* `CAP LS` advertises extensions so old clients keep working.
+
+### Payload plane
+* TLV registry: `TEXT_CHUNK`, `JSON_TOOL`, `EMBEDDING`,
+  `STATE_SNAPSHOT`, `STORE_FORWARD`, `CREDIT`, `FRAGMENT`. Unknown types
+  are relayed unchanged.
+* **Fragmentation both ways**: an oversized frame is split, with the
+  original TLV type carried inside the bundle; a receiver never delivers
+  half a message (`FRAG_ACK :partial` / `:complete`).
+* `CreditWindow` for producers of token streams.
+* **Store-and-forward**: a direct message to an unreachable agent is
+  held (256 per agent, 15 min TTL, expiry journaled) and delivered at
+  registration behind `STORED_INBOX <n>`. The sender was told `STORED`,
+  never "delivered".
+
+### Identity and abuse resistance
+* `AUTH <token>` before `NICK`: `<ag-id>.<expires-ms>.<caps-hex>.<hmac>`.
+  The **AG-ID comes from the token, not from the claim** — a renamed or
+  re-checked token fails, expiry is mandatory, comparison is
+  constant-time.
+* The `USER` capability mask is **intersected** with the token's:
+  announcing a capability is not being granted one.
+  `SPEAK 0x01 MODERATE 0x02 KICK 0x04 INSPECT 0x08 PAYLOAD 0x10`.
+* Rate limiting per connection (commands/s and bytes/s, sliding window);
+  a refusal does not consume budget.
+* An append-only audit log with a **hash chain**: an edited line cannot
+  keep its hash.
+
+### Federation
+Brokers link and agents reach each other across links (`--peer`,
+`--id`):
+
+* The link speaks AIPP itself with two link-only commands
+  (`FEDERATE`/`FEDERATED`, `RELAY`) intercepted **before** the agent
+  grammar, so an agent cannot forge them.
+* Flooding deduped by message id and bounded by 8 hops; a relay that
+  arrives at its origin is dropped — A↔B↔C cannot loop.
+* The origin is told `RELAYED <target> <links>` — "entered the mesh",
+  not "delivered". **Flooding without acks is at-most-once at best**;
+  the experiment asserts the loss instead of hiding it.
+* A target known-but-unreachable on the receiving broker is held by that
+  broker's store-and-forward — federation and the backlog compose.
+* Channel fan-out stays local in v1.0: a relayed channel message is
+  dropped rather than half-delivered.
+* Link peers are trusted by address; there is no broker authentication.
+
+### Security: TLS on both planes
+* `--tls-cert/--tls-key`: TLS 1.3 carrying **text lines and binary
+  frames** on the same encrypted socket.
+* A plaintext client gets no service — no downgrade.
+* Because a TLS session is stateful and cannot be cloned for a separate
+  writer thread, the reader and the `Outbox` writer share one connection
+  behind a mutex and the reader uses a 100 ms read timeout to release
+  it — which is also what bounds a slowloris.
+
+### Operations
+* `--state <path>`: channel snapshot (flags, topic, bans) written
+  atomically on every mutation and reloaded at boot. **Members are
+  deliberately not persisted** — a restart must not resurrect agents
+  that are not connected.
+* JSONL journal of every decision, hash-chained.
+
+## Conformance
+
+`conformance/vectors.json` is the byte-level test set any implementation
+can replay, and `aipp-core/tests/conformance.rs` replays it:
+
+1. 21 canonical lines, each idempotent (the canonical form re-parses to
+   itself);
+2. 13 refusals, each with the reason text it must carry;
+3. 3 frame encodings, lengths normative;
+4. a truncated frame is reported incomplete, never corrupt.
+
+Plus a 40k-case hostile-input stress test: the line parser and frame
+decoder always return, never panic, never over-allocate, and an
+announced 4 GiB payload is refused without allocation.
+
+## Verified results
+
+**`cargo test --workspace` → 44 tests** (unit + conformance + hostile
+input), `clippy -D warnings` and `cargo fmt --check` clean.
+
+**`experiments/experiment_001_dual_plane.py` → 18/18 PASS** — four real
+agents on a real broker: identification, presence broadcast, channel
+routing, binary multiplexing with the payload intact, operator
+privileges (`ERR 482` for a non-op), TTL eviction, and the hash-chained
+journal recording the session.
+
+**`experiments/experiment_002_hardening.py` → 18/18 PASS** — AUTH
+enforced, a token for `worker_1` cannot claim `supervisor_agent`, a
+renamed token fails the signature, `@pool:coder` dispatches by presence,
+`DRAIN` removes an agent from dispatch, `+m` refuses an unvoiced member
+and `+v` lets it speak, TOPIC/LIST/WHO work and `LIST` without
+`INSPECT` is refused, a burst is rate-limited (`ERR 439`), and ~1 MB
+pushed at a peer that never reads a byte does not freeze the broker.
+
+**`experiments/experiment_003_tls.py` → 6/6 PASS** — TLS 1.3
+(`TLS_AES_256_GCM_SHA384`), the control plane over TLS, a TLV frame
+accepted with the right length over the encrypted connection, the text
+stream undisturbed after binary traffic, and no downgrade for a
+plaintext client.
+
+**`experiments/experiment_004_federation.py` → 8/8 PASS** — three
+brokers in a chain (C → A → B, no direct C–B link): a message crosses
+the link with the sender attributed, the reply crosses back with no
+route table, a two-hop message reaches the far broker, flooding neither
+duplicates nor loops, an unknown target everywhere is relayed (and its
+loss is asserted, not hidden), and a stored message is not resurrected
+at registration.
+
+## Layout
 
 ```
-+------------------------------------------------------+
-|                 AIPP connection                      |
-+---------------------------+--------------------------+
-|  Control plane (text)     |  Payload plane (binary)  |
-|  JOIN #secops             |  TLV 0x0002 (JSON tool)  |
-|  STATUS agent_7 0x01 ...  |  TLV 0x0003 (embedding)  |
-+---------------------------+--------------------------+
+aipp-core/      the contract, no IO: control grammar (canonical forms),
+                presence, channels, TLV codec + fragmentation, flow
+                control (Outbox, CreditWindow), identity (AUTH, caps,
+                rate limit, audit chain)
+aipp-broker/    the edge broker: registration, presence TTL, channels,
+                dual-plane multiplexing, pools, drain, store-and-forward,
+                persistence, TLS, federation
+conformance/    byte-level vectors (normative)
+experiments/    4 end-to-end proofs, Python peers on purpose: the point
+                is cross-runtime interop
+SPEC.md         the normative document
 ```
-
-## Why the two halves belong together
-
-An orchestrator needs two different questions answered, and neither model
-answers both:
-
-* **Where does this task go?** IRC channels give ephemeral collaboration
-  spaces with no service-discovery graph to keep in sync — an agent joins
-  `#swarm-backend` and the swarm knows where it is.
-* **Can this agent take it right now?** ICQ presence gives a state vector
-  per node (`ONLINE`, `BUSY`, `HIGH_LOAD`, `AWAY`, `OFFLINE`) plus the VRAM
-  and in-flight task counts, so a scheduler sheds load instead of firing
-  work into a black hole.
-
-Presence without routing is a status page. Routing without presence drops
-tasks silently. Together they are a dispatch substrate.
 
 ## Quickstart
 
 ```bash
 cargo build --release
-./target/release/aipp-broker --host 0.0.0.0 --port 6669 --ttl-ms 15000
 
-# in another terminal — the control plane is telnet-compatible on purpose
-telnet 127.0.0.1 6669
-NICK my_agent
-USER coder-specialist 0x0F
-STATUS my_agent 0x01 32768 2
-JOIN #swarm
-PRIVMSG #swarm :hello from telnet
+# broker, open mode (debugging)
+./target/release/aipp-broker --port 7911 --ttl-ms 15000
+
+# broker, authenticated, with a persistent channel state
+./target/release/aipp-broker --port 7912 --auth-key <shared-secret> --state channels.json
+
+# broker with TLS
+openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem \
+        -days 1 -subj /CN=localhost
+./target/release/aipp-broker --port 7913 --tls-cert cert.pem --tls-key key.pem
+
+# a federation hub with two spokes
+./target/release/aipp-broker --port 7914 --id hub
+./target/release/aipp-broker --port 7915 --id spoke-1 --peer 127.0.0.1:7914
+
+# then, from a shell, an agent is just:
+#   printf 'NICK ag_1\r\nUSER coder 0x1f\r\nSTATUS ag_1 0x00 0 0\r\n' | nc localhost 7911
 ```
 
-Opening the port on a host with ufw:
+## Deliberately not implemented
 
-```bash
-sudo ufw allow 6669/tcp        # or: sudo ufw allow from 192.168.0.0/24 to any port 6669
-```
+Stated, not implied:
 
-## Control plane
+* **Delivery guarantees across the mesh** — flooding without acks is
+  at-most-once at best; see SPEC §13.
+* **Channel fan-out across brokers** — `#channels` are local in v1.0.
+* **Broker authentication** — link peers are trusted by address.
+* **Per-frame read deadlines configurable per deployment** — the reader
+  uses a fixed 100 ms timeout today.
+* **Outbound compression** — the TLV space has room for it; nothing is
+  claimed until it is measured.
+* **cargo-fuzz targets** — the hostile-input stress test is a
+  deterministic generator, not libFuzzer.
 
-Every line is `COMMAND [args] [ :trailing text]`, CRLF-terminated.
+## Version history
 
-| Command | Meaning |
+| Version | What landed |
 |---|---|
-| `NICK <agent_id>` | bind the session to an immutable AG-ID |
-| `USER <class> <caps>` | agent class + capability bitmask |
-| `STATUS <id> <state_hex> <vram_mb> <tasks>` | publish the presence vector |
-| `JOIN #chan` / `PART #chan [:reason]` | bind / leave a collaboration space |
-| `NAMES #chan` | who is here right now |
-| `PRIVMSG <#chan\|nick> :text` | message; members receive `:<sender> PRIVMSG ...` |
-| `NOTICE <#chan\|nick> :text` | system voice, never a reply |
-| `MODE #chan +o\|-o\|+v\|-v <nick>` | operator (`+o`) and voice (`+v`) flags |
-| `KICK #chan <nick> [:reason]` | operator-only removal |
-| `BIN_FRAME <target> <tlv_hex> <len>` | announce the next item is a binary frame |
-| `PING [:token]` / `PONG` | heartbeat; any command refreshes the lease |
-| `QUIT [:reason]` | graceful disconnect |
-
-Presence states: `0x00 ONLINE`, `0x01 BUSY` (queues work), `0x02 HIGH_LOAD`
-(shed non-critical), `0x03 AWAY`, `0x04 OFFLINE`.
-
-The broker owns the clock: an agent that stops talking for `--ttl-ms` is
-evicted and every peer receives
-
-```text
-QUIT ag_alpha_09 :Heartbeat timeout - dropping session
-```
-
-A node wedged in a GC pause cannot renew its own lease — that is the point.
-
-## Payload plane
-
-```
- 0                   1                   2                   3
- 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|  Magic (0x41) | Version (0x01)|         Frame Type (u16)      |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                     Payload Length (u32)                      |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|      TLV Type (u16)           |        Reserved (u16)         |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                        Payload (N bytes)                      |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-```
-
-| TLV | Meaning |
-|---|---|
-| `0x0001` | UTF-8 text token chunk (streamed LLM output) |
-| `0x0002` | structured JSON tool-execution payload (MCP / function call) |
-| `0x0003` | vector embedding, little-endian `f32[]` |
-| `0x0004` | state snapshot / memory checkpoint blob |
-| `0x0005` | store-and-forward envelope for an offline agent |
-
-**Demultiplexing rule:** an item is a binary frame **iff its first two
-bytes are `0x41 0x01`**; anything else is a control line. Printable text
-can never start with `0x41 0x01`, so the rule survives a frame split
-across TCP segments — and `telnet` keeps working.
-
-A frame must follow its `BIN_FRAME` announcement and match it; a
-mismatched type or length is refused with `ERR 409` instead of being
-routed. The sender gets `BIN_ACK <target> <bytes>`.
-
-## Verified results
-
-`python3 experiments/experiment_001_dual_plane.py` (real broker over TCP,
-four real agent sockets, run end to end):
-
-```
-PASS: identification: NICK/USER answered with ACK 001
-PASS: presence: STATUS is acknowledged with STATS_OK
-PASS: channel: JOIN is confirmed with JOINED
-PASS: channel: NAMES lists the whole membership
-PASS: channel: the first joiner holds operator status (@)
-PASS: presence: peers receive the STATUS broadcast
-PASS: routing: PRIVMSG reaches every other member
-PASS: routing: the sender does not receive their own PRIVMSG
-PASS: payload plane: a TLV 0x0002 frame reaches peers byte-identical
-PASS: payload plane: the sender gets BIN_ACK with the byte count
-PASS: payload plane: a frame that disagrees with its announcement is refused
-PASS: privileges: a non-operator MODE is refused with ERR 482
-PASS: privileges: the operator grants +v and the channel sees it
-PASS: privileges: KICK removes the member and notifies them
-PASS: privileges: the kicked agent is gone from NAMES
-PASS: lifecycle: a silent agent is evicted after the TTL and peers see QUIT
-PASS: lifecycle: the evicted agent left every channel
-PASS: observability: the JSONL log records the whole session
-
-18 passed, 0 failed
-EXPERIMENT_001: PASS
-```
-
-Unit tests: `cargo test --workspace` → **23 passed** (control-line parsing
-incl. the spec's own trace, presence TTL semantics, channel/flag rules,
-TLV header layout, partial-frame handling, hostile-length refusal).
-
-## Layout
-
-```
-aipp-core/      library: control vocabulary, presence engine, channel
-                registry, TLV codec — pure data, no IO
-aipp-broker/    the edge broker: TCP listener, routing, TTL sweeper,
-                JSONL audit log
-experiments/    runnable end-to-end proof
-```
-
-## Deliberately not implemented (v0.1)
-
-Honest scope, so nothing here is mistaken for "done":
-
-* **Federation between brokers** — one broker is one island. Cross-broker
-  channel linking is future work.
-* **QUIC transport** — the framing is transport-agnostic, but only TCP is
-  implemented and tested.
-* **Authentication** — `NICK`/`USER` identify, they do not authenticate.
-  Any agent can claim any id; run it behind mTLS or WireGuard.
-* **Moderated channels (`+m`)** — `+v` exists and is reported, but a
-  moderated mode that actually gates speech is not enforced yet.
-* **Store-and-forward** — TLV `0x0005` is reserved and documented; the
-  broker does not queue frames for offline agents.
-* **Backpressure** — writes to a slow peer block that peer's sender
-  thread; there is no per-connection output queue or flow control yet.
+| **v0.4.0** | store-and-forward, channel persistence, TLS on both planes, federation |
+| v0.3.0 | identity (AUTH + capabilities), backpressure (Outbox), presence-aware dispatch (`@pool`, `DRAIN`), full channel modes, TLV fragmentation, rate limiting, audit chain |
+| v0.2.0 | dual-plane E2E proof, broker, presence TTL, JSONL journal |
+| v0.1.0 | core: control grammar, presence, channels, TLV codec |
 
 ## License
 

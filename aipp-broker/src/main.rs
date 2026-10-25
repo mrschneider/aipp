@@ -325,6 +325,8 @@ fn main() {
     let mut log: Option<PathBuf> = None;
     let mut auth_key: Option<String> = None;
     let mut state_path: Option<PathBuf> = None;
+    let mut tls_cert: Option<String> = None;
+    let mut tls_key: Option<String> = None;
     let mut max_cmds_per_sec: u32 = 0;
     let mut max_bytes_per_sec: u32 = 0;
 
@@ -337,6 +339,8 @@ fn main() {
             "--log" => log = args.next().map(PathBuf::from),
             "--auth-key" => auth_key = args.next(),
             "--state" => state_path = args.next().map(PathBuf::from),
+            "--tls-cert" => tls_cert = args.next(),
+            "--tls-key" => tls_key = args.next(),
             "--max-cmds-per-sec" => {
                 max_cmds_per_sec = args.next().and_then(|p| p.parse().ok()).unwrap_or(0)
             }
@@ -363,7 +367,32 @@ fn main() {
             std::process::exit(1);
         }
     };
-    eprintln!("[aipp] broker listening on {host}:{port} (ttl {ttl_ms} ms)");
+    let tls: Option<Arc<rustls::ServerConfig>> = match (tls_cert, tls_key) {
+        (Some(cert), Some(key)) => {
+            let mut cert_reader = BufReader::new(std::fs::File::open(&cert).expect("tls cert"));
+            let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
+                .collect::<Result<_, _>>()
+                .expect("tls cert parse");
+            let mut key_reader = BufReader::new(std::fs::File::open(&key).expect("tls key"));
+            let key = rustls_pemfile::private_key(&mut key_reader)
+                .expect("tls key parse")
+                .expect("tls key present");
+            let cfg = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(certs, key)
+                .expect("tls config");
+            Some(Arc::new(cfg))
+        }
+        (None, None) => None,
+        _ => {
+            eprintln!("[aipp] --tls-cert and --tls-key go together");
+            std::process::exit(2);
+        }
+    };
+    eprintln!(
+        "[aipp] broker listening on {host}:{port} (ttl {ttl_ms} ms, {})",
+        if tls.is_some() { "TLS" } else { "plain TCP" }
+    );
 
     let mut broker_state = Broker::new(Duration::from_millis(ttl_ms), log);
     if let Some(key) = auth_key.clone() {
@@ -403,10 +432,19 @@ fn main() {
     for stream in listener.incoming().flatten() {
         let id = next_id.fetch_add(1, Ordering::SeqCst);
         let _ = stream.set_nodelay(true);
-        let out = match stream.try_clone() {
-            Ok(s) => s,
-            Err(_) => continue,
+        // a read timeout lets the reader release the connection lock, which
+        // a stateful TLS session requires
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+        let io: Io = match &tls {
+            Some(cfg) => match rustls::ServerConnection::new(cfg.clone()) {
+                Ok(conn) => Arc::new(Mutex::new(
+                    Box::new(rustls::StreamOwned::new(conn, stream)) as Box<dyn ReadWrite>
+                )),
+                Err(_) => continue,
+            },
+            None => Arc::new(Mutex::new(Box::new(stream) as Box<dyn ReadWrite>)),
         };
+        let out = Outbox::spawn(OutHandle(io.clone()), 256);
         let limits = {
             let b = broker.lock().unwrap();
             (b.max_cmds_per_sec, b.max_bytes_per_sec)
@@ -414,7 +452,7 @@ fn main() {
         let conn = Arc::new(Conn {
             id,
             name: Mutex::new(None),
-            out: Arc::new(Outbox::spawn(out, 256)),
+            out: Arc::new(out),
             pending: Mutex::new(None),
             identity: Mutex::new(None),
             caps: Mutex::new(0),
@@ -426,14 +464,14 @@ fn main() {
             b.journal("connect", json!({"conn": id}));
         }
         let broker = broker.clone();
-        std::thread::spawn(move || serve(broker, conn, stream));
+        std::thread::spawn(move || serve(broker, conn, io));
     }
 }
 
-fn serve(broker: Arc<Mutex<Broker>>, conn: Arc<Conn>, stream: TcpStream) {
-    let mut reader = BufReader::new(stream);
+fn serve(broker: Arc<Mutex<Broker>>, conn: Arc<Conn>, io: Io) {
+    let mut reader = NetReader::new(io);
     loop {
-        match read_item(&mut reader) {
+        match reader.next_item() {
             Ok(Some(Item::Line(line))) => {
                 if line.trim().is_empty() {
                     continue;
@@ -460,6 +498,128 @@ fn serve(broker: Arc<Mutex<Broker>>, conn: Arc<Conn>, stream: TcpStream) {
 /// them one at a time through the BufReader costs a memcpy, not a
 /// syscall, and keeps the rule exact even when a frame is split across
 /// TCP segments.
+/// A connection is plain TCP or TLS; the protocol above it is identical.
+trait ReadWrite: Read + Write + Send {}
+impl<T: Read + Write + Send> ReadWrite for T {}
+
+type Io = Arc<Mutex<Box<dyn ReadWrite>>>;
+
+/// Write half for the Outbox: it locks the same connection the reader
+/// uses, because a TLS session is stateful and cannot be cloned.
+struct OutHandle(Io);
+impl Write for OutHandle {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.lock().unwrap().flush()
+    }
+}
+
+/// Buffered reader over a shared connection. It never blocks on the mutex:
+/// a read timeout turns an idle socket into "no data yet", which is what
+/// lets the Outbox writer take the lock between reads.
+struct NetReader {
+    io: Io,
+    buf: Vec<u8>,
+    eof: bool,
+}
+
+impl NetReader {
+    fn new(io: Io) -> Self {
+        Self {
+            io,
+            buf: Vec::with_capacity(8192),
+            eof: false,
+        }
+    }
+
+    /// `Ok(false)` means "nothing arrived yet"; `Ok(true)` means progress.
+    fn fill(&mut self) -> std::io::Result<bool> {
+        let mut tmp = [0u8; 16384];
+        let read = {
+            let mut g = self.io.lock().unwrap();
+            g.read(&mut tmp)
+        };
+        match read {
+            Ok(0) => {
+                self.eof = true;
+                Ok(true)
+            }
+            Ok(n) => {
+                self.buf.extend_from_slice(&tmp[..n]);
+                Ok(true)
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn next_item(&mut self) -> std::io::Result<Option<Item>> {
+        loop {
+            if self.buf.is_empty() {
+                if self.eof {
+                    return Ok(None);
+                }
+                if !self.fill()? {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                continue;
+            }
+            // a frame starts with magic + version; anything else is a line
+            if self.buf[0] == aipp_core::tlv::MAGIC
+                && self.buf.get(1) == Some(&aipp_core::tlv::VERSION)
+            {
+                match Frame::decode(&self.buf) {
+                    Ok(Some((f, used))) => {
+                        self.buf.drain(..used);
+                        return Ok(Some(Item::Frame(f)));
+                    }
+                    Ok(None) => {
+                        if self.eof {
+                            return Ok(None);
+                        }
+                        if !self.fill()? {
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                        continue;
+                    }
+                    Err(e) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            e.to_string(),
+                        ))
+                    }
+                }
+            }
+            if let Some(pos) = self.buf.iter().position(|&c| c == b'\n') {
+                let line: Vec<u8> = self.buf.drain(..=pos).collect();
+                return Ok(Some(Item::Line(
+                    String::from_utf8_lossy(&line).trim_end().to_string(),
+                )));
+            }
+            if self.eof {
+                let rest: Vec<u8> = std::mem::take(&mut self.buf);
+                if rest.is_empty() {
+                    return Ok(None);
+                }
+                return Ok(Some(Item::Line(
+                    String::from_utf8_lossy(&rest).trim_end().to_string(),
+                )));
+            }
+            if !self.fill()? {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
 fn read_item(reader: &mut BufReader<TcpStream>) -> std::io::Result<Option<Item>> {
     let mut first = [0u8; 1];
     if reader.read(&mut first)? == 0 {

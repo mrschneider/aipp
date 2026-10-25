@@ -8,3 +8,5 @@ repository.workspace = true
 description = "AIPP — Agentic Internet & Presence Protocol: dual-plane framing, presence engine, channel routing, TLV codec"
 
 [dependencies]
+hmac = { workspace = true }
+sha2 = { workspace = true }

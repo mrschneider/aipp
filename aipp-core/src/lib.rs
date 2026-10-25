@@ -35,12 +35,18 @@
 
 pub mod channel;
 pub mod control;
+pub mod error;
+pub mod flow;
 pub mod presence;
+pub mod security;
 pub mod tlv;
 
 pub use channel::{Channel, Flags, Registry};
 pub use control::Command;
+pub use error::{AippError, ErrorKind};
+pub use flow::{CreditWindow, FlowError, Outbox};
 pub use presence::{AgentRecord, PresenceState};
+pub use security::{cap, AuditChain, Authority, Identity, RateLimiter};
 pub use tlv::{Frame, FrameError};
 
 /// Protocol version advertised in the binary frame header.

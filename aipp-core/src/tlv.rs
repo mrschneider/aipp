@@ -38,6 +38,10 @@ pub const HEADER_LEN: usize = 12;
 /// Refuse absurd lengths instead of allocating what a hostile peer asks.
 pub const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
 
+/// Frames larger than this are fragmented, keeping one frame's work
+/// bounded and a hostile header from asking for a huge allocation.
+pub const MAX_FRAGMENT: usize = 64 * 1024;
+
 /// The TLV type registry (section 4 of the spec).
 pub mod tlv_type {
     /// Raw UTF-8 text token chunk — streamed LLM output.
@@ -50,6 +54,8 @@ pub mod tlv_type {
     pub const STATE_SNAPSHOT: u16 = 0x0004;
     /// Store-and-forward envelope for an offline agent's queue.
     pub const STORE_FORWARD: u16 = 0x0005;
+    /// Continuation of a fragmented TLV payload (AIPP's own extension).
+    pub const FRAGMENT: u16 = 0x0007;
 }
 
 /// Human label for a TLV type, for logs and `NOTICE`s.
@@ -60,6 +66,7 @@ pub fn tlv_label(t: u16) -> &'static str {
         tlv_type::EMBEDDING => "EMBEDDING",
         tlv_type::STATE_SNAPSHOT => "STATE_SNAPSHOT",
         tlv_type::STORE_FORWARD => "STORE_FORWARD",
+        tlv_type::FRAGMENT => "FRAGMENT",
         _ => "UNKNOWN",
     }
 }
@@ -205,6 +212,84 @@ impl Frame {
     }
 }
 
+/// Split a payload into `FRAGMENT` frames: a 6-byte header (bundle id,
+/// index, total) then the chunk. Reassembly is by bundle id, and an
+/// incomplete set is never delivered — the same rule as GAIP's GIOP
+/// fragments, because a half message is worse than none.
+pub fn fragment_payload(bundle_id: u32, payload: &[u8], max: usize) -> Vec<Frame> {
+    let max = max.clamp(64, MAX_FRAGMENT);
+    let chunks: Vec<&[u8]> = payload.chunks(max).collect();
+    let total = chunks.len().max(1) as u16;
+    chunks
+        .into_iter()
+        .enumerate()
+        .map(|(i, chunk)| {
+            let mut body = Vec::with_capacity(6 + chunk.len());
+            body.extend_from_slice(&bundle_id.to_be_bytes());
+            body.extend_from_slice(&(i as u16).to_be_bytes());
+            body.extend_from_slice(&total.to_be_bytes());
+            body.extend_from_slice(chunk);
+            Frame::new(tlv_type::FRAGMENT, body)
+        })
+        .collect()
+}
+
+/// Collects fragments until a set is complete.
+/// bundle id -> (total fragments, received chunks)
+type Partial = std::collections::HashMap<u32, (u16, Vec<Option<Vec<u8>>>)>;
+
+#[derive(Debug, Default)]
+pub struct Reassembler {
+    partial: Partial,
+}
+
+impl Reassembler {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed one fragment. Returns the whole payload once every fragment
+    /// of that bundle has arrived.
+    pub fn push(&mut self, frame: &Frame) -> Option<(u32, Vec<u8>)> {
+        if frame.tlv_type != tlv_type::FRAGMENT || frame.payload.len() < 6 {
+            return None;
+        }
+        let id = u32::from_be_bytes([
+            frame.payload[0],
+            frame.payload[1],
+            frame.payload[2],
+            frame.payload[3],
+        ]);
+        let index = u16::from_be_bytes([frame.payload[4], frame.payload[5]]) as usize;
+        // total lives in the chunk header for the first fragment only in
+        // some encodings; here every fragment carries it in bytes 4..6 of
+        // the body prefix, so parse it from the third field
+        let total = u16::from_be_bytes([
+            frame.payload.get(6).copied().unwrap_or(0),
+            frame.payload.get(7).copied().unwrap_or(0),
+        ]) as usize;
+        let chunk = frame.payload.get(8..)?.to_vec();
+        if total == 0 || index >= total {
+            return None;
+        }
+        let entry = self
+            .partial
+            .entry(id)
+            .or_insert_with(|| (total as u16, vec![None; total]));
+        entry.1[index] = Some(chunk);
+        if entry.1.iter().all(|p| p.is_some()) {
+            let (_, parts) = self.partial.remove(&id)?;
+            let joined: Vec<u8> = parts.into_iter().flatten().flatten().collect();
+            return Some((id, joined));
+        }
+        None
+    }
+
+    pub fn pending(&self) -> usize {
+        self.partial.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,6 +385,36 @@ mod tests {
             Frame::decode(&hostile).unwrap_err(),
             FrameError::TooLarge(_)
         ));
+    }
+
+    #[test]
+    fn a_large_payload_fragments_and_reassembles() {
+        let payload: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+        let frames = fragment_payload(7, &payload, 512);
+        assert!(frames.len() > 8, "5000 B at 512/frag -> {}", frames.len());
+        let mut r = Reassembler::new();
+        let mut out = None;
+        for f in &frames {
+            if let Some(done) = r.push(f) {
+                out = Some(done);
+            }
+        }
+        let (id, joined) = out.expect("a complete set must reassemble");
+        assert_eq!(id, 7);
+        assert_eq!(joined, payload);
+        assert_eq!(r.pending(), 0);
+    }
+
+    #[test]
+    fn an_incomplete_set_is_never_delivered() {
+        let payload: Vec<u8> = vec![9u8; 2000];
+        let mut frames = fragment_payload(1, &payload, 256);
+        frames.pop();
+        let mut r = Reassembler::new();
+        for f in &frames {
+            assert!(r.push(f).is_none(), "half a message must not be delivered");
+        }
+        assert_eq!(r.pending(), 1);
     }
 
     #[test]

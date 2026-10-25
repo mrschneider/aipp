@@ -39,6 +39,15 @@ impl Flags {
 pub struct Channel {
     pub name: String,
     pub members: BTreeMap<String, Flags>,
+    /// `+m`: only operators and voiced members may speak
+    pub moderated: bool,
+    /// `+i`: only invited agents may join
+    pub invite_only: bool,
+    /// `+t`: only operators may change the topic
+    pub topic_locked: bool,
+    pub topic: Option<String>,
+    pub invites: std::collections::BTreeSet<String>,
+    pub bans: std::collections::BTreeSet<String>,
 }
 
 impl Channel {
@@ -46,6 +55,12 @@ impl Channel {
         Self {
             name: name.into(),
             members: BTreeMap::new(),
+            moderated: false,
+            invite_only: false,
+            topic_locked: true,
+            topic: None,
+            invites: Default::default(),
+            bans: Default::default(),
         }
     }
 
@@ -77,6 +92,18 @@ impl Channel {
 
     pub fn is_op(&self, agent: &str) -> bool {
         self.members.get(agent).map(|f| f.op).unwrap_or(false)
+    }
+
+    /// May this agent speak here? `+m` is the rule that makes `+v` mean
+    /// something; without it voice was a decoration.
+    pub fn may_speak(&self, agent: &str) -> bool {
+        if !self.moderated {
+            return true;
+        }
+        self.members
+            .get(agent)
+            .map(|f| f.op || f.voice)
+            .unwrap_or(false)
     }
 }
 
@@ -151,6 +178,29 @@ impl Registry {
     }
 
     /// Members of a channel, in stable order.
+    /// Operator view: one line per channel, deterministic order.
+    pub fn list(&self) -> Vec<String> {
+        self.channels
+            .values()
+            .map(|c| {
+                let flags = format!(
+                    "{}{}{}",
+                    if c.moderated { "m" } else { "-" },
+                    if c.invite_only { "i" } else { "-" },
+                    if c.topic_locked { "t" } else { "-" }
+                );
+                format!(
+                    "CHAN {} members={} ops={} flags=+{} topic={}",
+                    c.name,
+                    c.members.len(),
+                    c.members.values().filter(|f| f.op).count(),
+                    flags,
+                    c.topic.as_deref().unwrap_or("")
+                )
+            })
+            .collect()
+    }
+
     pub fn members(&self, channel: &str) -> Vec<String> {
         self.channels
             .get(channel)
@@ -166,6 +216,85 @@ impl Registry {
         self.channels
             .get(channel)
             .map(|c| c.is_op(agent))
+            .unwrap_or(false)
+    }
+
+    /// Set a channel flag (`+m`, `+i`, `+t`). Only operators do this; the
+    /// permission check lives in the broker.
+    pub fn set_flag(&mut self, channel: &str, flag: char, on: bool) -> Result<(), String> {
+        let Some(chan) = self.channels.get_mut(channel) else {
+            return Err(format!("no such channel {channel}"));
+        };
+        match flag {
+            'm' => chan.moderated = on,
+            'i' => chan.invite_only = on,
+            't' => chan.topic_locked = on,
+            other => return Err(format!("unsupported channel flag '{other}' (use m, i, t)")),
+        }
+        Ok(())
+    }
+
+    pub fn set_topic(&mut self, channel: &str, topic: Option<String>) -> Result<(), String> {
+        let Some(chan) = self.channels.get_mut(channel) else {
+            return Err(format!("no such channel {channel}"));
+        };
+        chan.topic = topic;
+        Ok(())
+    }
+
+    pub fn topic(&self, channel: &str) -> Option<String> {
+        self.channels.get(channel).and_then(|c| c.topic.clone())
+    }
+
+    pub fn set_ban(&mut self, channel: &str, agent: &str, on: bool) -> Result<(), String> {
+        let Some(chan) = self.channels.get_mut(channel) else {
+            return Err(format!("no such channel {channel}"));
+        };
+        if on {
+            chan.bans.insert(agent.to_string());
+        } else {
+            chan.bans.remove(agent);
+        }
+        Ok(())
+    }
+
+    pub fn is_banned(&self, channel: &str, agent: &str) -> bool {
+        self.channels
+            .get(channel)
+            .map(|c| c.bans.contains(agent))
+            .unwrap_or(false)
+    }
+
+    pub fn invite(&mut self, channel: &str, agent: &str) {
+        if let Some(c) = self.channels.get_mut(channel) {
+            c.invites.insert(agent.to_string());
+        }
+    }
+
+    pub fn may_join(&self, channel: &str, agent: &str) -> Result<(), String> {
+        let Some(chan) = self.channels.get(channel) else {
+            return Ok(()); // a new channel has no rules yet
+        };
+        if chan.bans.contains(agent) {
+            return Err(format!("{agent} is banned from {channel}"));
+        }
+        if chan.invite_only && !chan.invites.contains(agent) && !chan.members.contains_key(agent) {
+            return Err(format!("{channel} is invite-only (+i)"));
+        }
+        Ok(())
+    }
+
+    pub fn may_speak(&self, channel: &str, agent: &str) -> bool {
+        self.channels
+            .get(channel)
+            .map(|c| c.may_speak(agent))
+            .unwrap_or(true)
+    }
+
+    pub fn is_moderated(&self, channel: &str) -> bool {
+        self.channels
+            .get(channel)
+            .map(|c| c.moderated)
             .unwrap_or(false)
     }
 

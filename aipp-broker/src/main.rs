@@ -16,11 +16,14 @@
 //! federation between brokers, blocking writes to slow peers.
 
 use aipp_core::channel::Registry;
+use aipp_core::control::is_pool;
 use aipp_core::control::Command;
+use aipp_core::flow::{FlowError, Outbox};
 use aipp_core::presence::AgentRecord;
+use aipp_core::security::{cap, Authority, Identity, RateLimiter};
 use aipp_core::tlv::{tlv_label, Frame};
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -46,17 +49,27 @@ struct Conn {
     id: u64,
     /// Set by `NICK`; `None` until the agent identifies itself.
     name: Mutex<Option<String>>,
-    out: Mutex<TcpStream>,
+    /// bounded output queue with its own writer thread: a stalled peer
+    /// produces `ERR 509` instead of parking the broker
+    out: Arc<Outbox>,
     pending: Mutex<Option<PendingFrame>>,
+    /// Verified identity, when the broker requires one.
+    identity: Mutex<Option<Identity>>,
+    /// advertised capabilities from `USER`
+    caps: Mutex<u32>,
+    limiter: Mutex<RateLimiter>,
 }
 
 impl Conn {
     fn send_bytes(&self, bytes: &[u8]) {
-        let mut out = self.out.lock().unwrap();
-        // one write_all per frame: never let two threads interleave
-        // fragments of a line or a frame on the same socket
-        let _ = out.write_all(bytes);
-        let _ = out.flush();
+        // the Outbox serialises writes on its own thread, so two threads
+        // can never interleave fragments of a line on the same socket
+        let _ = self.out.send(bytes.to_vec());
+    }
+
+    /// Same, but the caller learns that the peer is not draining.
+    fn send_line_checked(&self, line: &str) -> Result<(), FlowError> {
+        self.out.send(format!("{line}\r\n").into_bytes())
     }
 
     fn send_line(&self, line: &str) {
@@ -70,6 +83,14 @@ struct Broker {
     reg: Registry,
     ttl: Duration,
     log: Option<PathBuf>,
+    /// `Some` = AUTH is required before NICK and the AG-ID comes from the
+    /// token, not from the claim
+    auth: Option<Authority>,
+    /// per-connection limits; 0 = unlimited
+    max_cmds_per_sec: u32,
+    max_bytes_per_sec: u32,
+    /// agents that asked to drain: no new tasks are dispatched to them
+    draining: BTreeSet<String>,
 }
 
 impl Broker {
@@ -80,6 +101,10 @@ impl Broker {
             reg: Registry::new(),
             ttl,
             log,
+            auth: None,
+            max_cmds_per_sec: 0,
+            max_bytes_per_sec: 0,
+            draining: BTreeSet::new(),
         }
     }
 
@@ -181,6 +206,9 @@ fn main() {
     let mut port = 6669u16;
     let mut ttl_ms = 15_000u64;
     let mut log: Option<PathBuf> = None;
+    let mut auth_key: Option<String> = None;
+    let mut max_cmds_per_sec: u32 = 0;
+    let mut max_bytes_per_sec: u32 = 0;
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -189,6 +217,13 @@ fn main() {
             "--port" => port = args.next().and_then(|p| p.parse().ok()).unwrap_or(port),
             "--ttl-ms" => ttl_ms = args.next().and_then(|p| p.parse().ok()).unwrap_or(ttl_ms),
             "--log" => log = args.next().map(PathBuf::from),
+            "--auth-key" => auth_key = args.next(),
+            "--max-cmds-per-sec" => {
+                max_cmds_per_sec = args.next().and_then(|p| p.parse().ok()).unwrap_or(0)
+            }
+            "--max-bytes-per-sec" => {
+                max_bytes_per_sec = args.next().and_then(|p| p.parse().ok()).unwrap_or(0)
+            }
             "-h" | "--help" => {
                 println!(
                     "aipp-broker [--host 0.0.0.0] [--port 6669] [--ttl-ms 15000] [--log <jsonl>]"
@@ -211,7 +246,13 @@ fn main() {
     };
     eprintln!("[aipp] broker listening on {host}:{port} (ttl {ttl_ms} ms)");
 
-    let broker = Arc::new(Mutex::new(Broker::new(Duration::from_millis(ttl_ms), log)));
+    let mut broker_state = Broker::new(Duration::from_millis(ttl_ms), log);
+    if let Some(key) = auth_key.clone() {
+        broker_state.auth = Some(Authority::new(key));
+    }
+    broker_state.max_cmds_per_sec = max_cmds_per_sec;
+    broker_state.max_bytes_per_sec = max_bytes_per_sec;
+    let broker = Arc::new(Mutex::new(broker_state));
     let next_id = Arc::new(AtomicU64::new(1));
 
     // TTL sweeper: the only clock in the system.
@@ -241,11 +282,18 @@ fn main() {
             Ok(s) => s,
             Err(_) => continue,
         };
+        let limits = {
+            let b = broker.lock().unwrap();
+            (b.max_cmds_per_sec, b.max_bytes_per_sec)
+        };
         let conn = Arc::new(Conn {
             id,
             name: Mutex::new(None),
-            out: Mutex::new(out),
+            out: Arc::new(Outbox::spawn(out, 256)),
             pending: Mutex::new(None),
+            identity: Mutex::new(None),
+            caps: Mutex::new(0),
+            limiter: Mutex::new(RateLimiter::new(limits.0, limits.1)),
         });
         {
             let mut b = broker.lock().unwrap();
@@ -351,10 +399,23 @@ fn handle_line(broker: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, line: &str) -> Res
         }
     };
 
-    // everything except NICK/USER/PING requires an identity
+    // flood defence: a refusal costs the sender its command, not the broker
+    {
+        let mut lim = conn.limiter.lock().unwrap();
+        if let Err(e) = lim.allow(line.len() + 2) {
+            reply_err(conn, e.numeric(), &e.message);
+            return Ok(());
+        }
+    }
+
+    // everything except AUTH/NICK/USER/PING/CAP requires an identity
     let needs_identity = !matches!(
         cmd,
-        Command::Nick(_) | Command::User { .. } | Command::Ping(_)
+        Command::Nick(_)
+            | Command::User { .. }
+            | Command::Ping(_)
+            | Command::Auth(_)
+            | Command::Cap
     );
     if needs_identity && name_of(conn).is_none() {
         reply_err(conn, 451, "You have not registered (NICK first)");
@@ -368,6 +429,27 @@ fn handle_line(broker: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, line: &str) -> Res
                 drop(b);
                 reply_err(conn, 462, "You are already registered");
                 return Ok(());
+            }
+            if let Some(auth) = b.auth.clone() {
+                let id = conn.identity.lock().unwrap().clone();
+                match id {
+                    None => {
+                        drop(b);
+                        reply_err(conn, 464, "AUTH required before NICK");
+                        return Ok(());
+                    }
+                    Some(id) if id.ag_id != nick => {
+                        drop(b);
+                        reply_err(
+                            conn,
+                            464,
+                            &format!("this token authenticates '{}', not '{nick}'", id.ag_id),
+                        );
+                        return Ok(());
+                    }
+                    Some(_) => {}
+                }
+                let _ = auth;
             }
             if b.agents.contains_key(&nick) {
                 drop(b);
@@ -385,13 +467,23 @@ fn handle_line(broker: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, line: &str) -> Res
         }
         Command::User { class, caps } => {
             let name = name_of(conn).unwrap();
+            // the self-declared mask is intersected with what the token
+            // granted: announcing a capability is not being granted one
+            let effective = match conn.identity.lock().unwrap().clone() {
+                Some(id) => caps & id.caps,
+                None => caps,
+            };
+            *conn.caps.lock().unwrap() = effective;
             let mut b = broker.lock().unwrap();
             if let Some(a) = b.agents.get_mut(&name) {
                 a.class = class.clone();
-                a.caps = caps;
+                a.caps = effective;
                 a.touch(Instant::now());
             }
-            b.journal("user", json!({"ag_id": name, "class": class, "caps": caps}));
+            b.journal(
+                "user",
+                json!({"ag_id": name, "class": class, "caps": effective}),
+            );
         }
         Command::Status {
             agent,
@@ -498,6 +590,45 @@ fn handle_line(broker: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, line: &str) -> Res
             let recipients;
             {
                 let b = broker.lock().unwrap();
+                // `@pool:<class>` is presence-aware: the broker picks a
+                // member of that class that is actually taking work
+                if is_pool(&target) {
+                    let pool = target.trim_start_matches("@pool:").to_string();
+                    let pick = b
+                        .agents
+                        .values()
+                        .filter(|a| a.class == pool)
+                        .filter(|a| a.state.accepts_tasks())
+                        .filter(|a| !b.draining.contains(&a.ag_id))
+                        .min_by_key(|a| a.active_tasks)
+                        .map(|a| a.ag_id.clone());
+                    match pick {
+                        Some(ag) => {
+                            drop(b);
+                            let line = format!(":{me} PRIVMSG {ag} :{text}");
+                            let c = {
+                                let b = broker.lock().unwrap();
+                                b.conn_of(&ag)
+                            };
+                            match c {
+                                Some(c) => {
+                                    if c.send_line_checked(&line).is_err() {
+                                        reply_err(conn, 509, &format!("{ag} is not draining"));
+                                    }
+                                }
+                                None => {
+                                    reply_err(conn, 401, &format!("No live connection for {ag}"))
+                                }
+                            }
+                            return Ok(());
+                        }
+                        None => {
+                            drop(b);
+                            reply_err(conn, 401, &format!("no live agent in {target}"));
+                            return Ok(());
+                        }
+                    }
+                }
                 if target.starts_with('#') && !b.reg.exists(&target) {
                     drop(b);
                     reply_err(conn, 403, &format!("No such channel {target}"));
@@ -512,6 +643,12 @@ fn handle_line(broker: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, line: &str) -> Res
                     if is_notice { "notice" } else { "privmsg" },
                     json!({"from": me, "to": target, "text": text}),
                 );
+                // `+m`: the rule that gives `+v` its meaning
+                if target.starts_with('#') && !b.reg.may_speak(&target, &me) {
+                    drop(b);
+                    reply_err(conn, 404, &format!("{target} :you are not voiced (+m)"));
+                    return Ok(());
+                }
                 recipients = b.targets(&target, &me);
             }
             let verb = if is_notice { "NOTICE" } else { "PRIVMSG" };
@@ -539,7 +676,13 @@ fn handle_line(broker: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, line: &str) -> Res
                     );
                     return Ok(());
                 }
-                if let Err(e) = b.reg.set_mode(&channel, &target, flag, on) {
+                // `+m`/`+i`/`+t` are channel flags, not member flags
+                let result = if matches!(flag, 'm' | 'i' | 't') {
+                    b.reg.set_flag(&channel, flag, on)
+                } else {
+                    b.reg.set_mode(&channel, &target, flag, on)
+                };
+                if let Err(e) = result {
                     drop(b);
                     reply_err(conn, 441, &e);
                     return Ok(());
@@ -602,6 +745,172 @@ fn handle_line(broker: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, line: &str) -> Res
                     c.send_line(&line);
                 }
             }
+        }
+        Command::Auth(token) => {
+            let auth = {
+                let b = broker.lock().unwrap();
+                b.auth.clone()
+            };
+            let Some(auth) = auth else {
+                reply_err(
+                    conn,
+                    464,
+                    "this broker runs open (start it with --auth-key to require AUTH)",
+                );
+                return Ok(());
+            };
+            match auth.verify(&token) {
+                Ok(id) => {
+                    *conn.caps.lock().unwrap() = id.caps;
+                    *conn.identity.lock().unwrap() = Some(id.clone());
+                    {
+                        let b = broker.lock().unwrap();
+                        b.journal(
+                            "auth_ok",
+                            json!({"conn": conn.id, "ag_id": id.ag_id, "caps": id.caps}),
+                        );
+                    }
+                    conn.send_line(&format!("AUTH_OK {} caps=0x{:x}", id.ag_id, id.caps));
+                }
+                Err(e) => {
+                    {
+                        let b = broker.lock().unwrap();
+                        b.journal("auth_fail", json!({"conn": conn.id}));
+                    }
+                    reply_err(conn, e.numeric(), &e.message);
+                }
+            }
+        }
+        Command::Cap => {
+            // extensions are advertised, never assumed: an old client keeps
+            // working because it simply ignores this line
+            conn.send_line(&format!(
+                "CAP LS :aipp=1.0 AUTH FRAGMENT CREDIT POOL TOPIC MODES=mitb DRAIN \
+                 TLVS=0x0001,0x0002,0x0003,0x0004,0x0005,0x0006,0x0007 CAPS={}",
+                cap::explain()
+            ));
+        }
+        Command::Topic { channel, topic } => {
+            let me = name_of(conn).unwrap();
+            let mut b = broker.lock().unwrap();
+            if !b.reg.exists(&channel) {
+                drop(b);
+                reply_err(conn, 403, &format!("No such channel {channel}"));
+                return Ok(());
+            }
+            match topic {
+                None => {
+                    let t = b.reg.topic(&channel).unwrap_or_default();
+                    drop(b);
+                    conn.send_line(&format!("TOPIC {channel} :{t}"));
+                }
+                Some(t) => {
+                    if !b.reg.is_op(&channel, &me) {
+                        drop(b);
+                        reply_err(conn, 482, &format!("{channel} :you are not an operator"));
+                        return Ok(());
+                    }
+                    if let Err(e) = b.reg.set_topic(&channel, Some(t.clone())) {
+                        drop(b);
+                        reply_err(conn, 403, &e);
+                        return Ok(());
+                    }
+                    let members = b.reg.members(&channel);
+                    b.journal(
+                        "topic",
+                        json!({"ag_id": me, "channel": channel, "topic": t}),
+                    );
+                    drop(b);
+                    conn.send_line(&format!("TOPIC_SET {channel}"));
+                    for m in members {
+                        let b = broker.lock().unwrap();
+                        if let Some(c) = b.conn_of(&m) {
+                            c.send_line(&format!(":{me} TOPIC {channel} :{t}"));
+                        }
+                    }
+                }
+            }
+        }
+        Command::List => {
+            let rows: Vec<String> = {
+                let b = broker.lock().unwrap();
+                if !cap::has(*conn.caps.lock().unwrap(), cap::INSPECT) {
+                    drop(b);
+                    reply_err(conn, 482, "LIST requires the INSPECT capability");
+                    return Ok(());
+                }
+                b.reg.list()
+            };
+            conn.send_line(&format!("LIST_START {}", rows.len()));
+            for row in rows {
+                conn.send_line(&row);
+            }
+            conn.send_line("LIST_END");
+        }
+        Command::Who(target) => {
+            let rows: Vec<String> = {
+                let b = broker.lock().unwrap();
+                if !cap::has(*conn.caps.lock().unwrap(), cap::INSPECT) {
+                    drop(b);
+                    reply_err(conn, 482, "WHO requires the INSPECT capability");
+                    return Ok(());
+                }
+                match &target {
+                    Some(t) if is_pool(t) => b
+                        .agents
+                        .values()
+                        .filter(|a| t == &format!("@pool:{}", a.class))
+                        .map(|a| {
+                            format!(
+                                "WHO {} {} {} {}",
+                                a.ag_id,
+                                a.class,
+                                a.state.hex(),
+                                if b.draining.contains(&a.ag_id) {
+                                    "DRAINING"
+                                } else {
+                                    "ACTIVE"
+                                }
+                            )
+                        })
+                        .collect(),
+                    Some(t) if t.starts_with('#') => b
+                        .reg
+                        .members(t)
+                        .into_iter()
+                        .filter_map(|m| b.agents.get(&m).cloned())
+                        .map(|a| format!("WHO {} {} {} ACTIVE", a.ag_id, a.class, a.state.hex()))
+                        .collect(),
+                    _ => b
+                        .agents
+                        .values()
+                        .map(|a| format!("WHO {} {} {} ACTIVE", a.ag_id, a.class, a.state.hex()))
+                        .collect(),
+                }
+            };
+            conn.send_line(&format!("WHO_START {}", rows.len()));
+            for row in rows {
+                conn.send_line(&row);
+            }
+            conn.send_line("WHO_END");
+        }
+        Command::Drain => {
+            let me = name_of(conn).unwrap();
+            {
+                let mut b = broker.lock().unwrap();
+                b.draining.insert(me.clone());
+                if let Some(a) = b.agents.get_mut(&me) {
+                    a.set_status(
+                        aipp_core::presence::PresenceState::Away,
+                        a.vram_free_mb,
+                        a.active_tasks,
+                    );
+                }
+                b.journal("drain", json!({"ag_id": me}));
+            }
+            conn.send_line(&format!(
+                "DRAINING {me} :new tasks will not be dispatched to you"
+            ));
         }
         Command::Quit { reason } => {
             let me = name_of(conn).unwrap();

@@ -180,8 +180,12 @@ def main():
         )
 
         # ---- 3. channels ---------------------------------------------------
+        # Join one at a time and wait for each JOINED: "the first joiner
+        # holds operator status" is only a meaningful claim when the order
+        # is actually defined (writes are queued by the broker's Outbox).
         for c in (supervisor, builder, qa, rogue):
             c.send("JOIN #swarm-backend")
+            c.wait_line(lambda l: l.startswith("JOINED #swarm-backend"))
         joined = supervisor.wait_line(lambda l: l.startswith("JOINED #swarm-backend"))
         # The JOIN reply lists the roster at THAT instant, so poll NAMES
         # until every agent is in: this is also the operator's own tool

@@ -57,6 +57,23 @@ pub enum Command {
     Pong(Option<String>),
     /// `NAMES #channel` — ask who is present right now.
     Names(String),
+    /// `AUTH <token>` — prove identity before NICK; the AG-ID comes from
+    /// the token, never from the claim.
+    Auth(String),
+    /// `CAP LS` — advertise optional capabilities so extensions can be
+    /// added without breaking old clients.
+    Cap,
+    /// `TOPIC #channel [:new topic]` — read or set the topic.
+    Topic {
+        channel: String,
+        topic: Option<String>,
+    },
+    /// `LIST` — operator view of channels and occupancy.
+    List,
+    /// `WHO [#channel|@pool]` — operator view of participants.
+    Who(Option<String>),
+    /// `DRAIN` — stop accepting new work, finish what is in flight.
+    Drain,
     /// `BIN_FRAME <#channel|nick> <tlv_type_hex> <length>` — announces
     /// that the next item on the wire is a binary frame of that size.
     BinFrame {
@@ -76,6 +93,32 @@ fn split_trailing(line: &str) -> (Vec<&str>, Option<&str>) {
         }
         None => (trimmed.split_whitespace().collect(), None),
     }
+}
+
+/// `@pool:name` addresses a group of agents; the broker picks a live one
+/// by presence. `#channel` addresses a channel.
+pub fn parse_target(name: &str) -> Result<String, String> {
+    if name.starts_with('@') {
+        let pool = name.strip_prefix('@').unwrap_or(name);
+        let (kind, rest) = pool
+            .split_once(':')
+            .ok_or_else(|| format!("a pool target is '@pool:<name>', got '{name}'"))?;
+        if kind != "pool" || rest.is_empty() {
+            return Err(format!("a pool target is '@pool:<name>', got '{name}'"));
+        }
+        if !rest
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(format!("invalid pool name '{rest}'"));
+        }
+        return Ok(name.to_string());
+    }
+    parse_channel(name)
+}
+
+pub fn is_pool(target: &str) -> bool {
+    target.starts_with("@pool:")
 }
 
 fn parse_channel(name: &str) -> Result<String, String> {
@@ -143,6 +186,22 @@ impl Command {
             }
             "JOIN" => Ok(Command::Join(parse_channel(arg(0, "channel")?)?)),
             "NAMES" => Ok(Command::Names(parse_channel(arg(0, "channel")?)?)),
+            "AUTH" => Ok(Command::Auth(arg(0, "token")?.to_string())),
+            "CAP" => {
+                if let Some(sub) = args.first() {
+                    if !sub.eq_ignore_ascii_case("LS") && !sub.eq_ignore_ascii_case("LIST") {
+                        return Err(format!("CAP: unknown subcommand '{sub}' (use LS)"));
+                    }
+                }
+                Ok(Command::Cap)
+            }
+            "TOPIC" => Ok(Command::Topic {
+                channel: parse_channel(arg(0, "channel")?)?,
+                topic: trailing.map(str::to_string),
+            }),
+            "LIST" => Ok(Command::List),
+            "WHO" => Ok(Command::Who(args.first().map(|s| s.to_string()))),
+            "DRAIN" => Ok(Command::Drain),
             "PART" => Ok(Command::Part {
                 channel: parse_channel(arg(0, "channel")?)?,
                 reason: trailing.map(str::to_string),
@@ -182,16 +241,22 @@ impl Command {
                     '-' => false,
                     _ => unreachable!("sign was validated above"),
                 };
-                if flag != 'o' && flag != 'v' {
+                // member flags (o, v) name a target; channel flags
+                // (m, i, t) do not
+                if !matches!(flag, 'o' | 'v' | 'm' | 'i' | 't') {
                     return Err(format!(
-                        "MODE: unsupported channel flag '{flag}' (use o or v)"
+                        "MODE: unsupported flag '{flag}' (member: o, v; channel: m, i, t)"
                     ));
                 }
                 Ok(Command::Mode {
                     channel,
                     flag,
                     on,
-                    target: arg(2, "target nick")?.to_string(),
+                    target: if matches!(flag, 'm' | 'i' | 't') {
+                        args.get(2).map(|s| s.to_string()).unwrap_or_default()
+                    } else {
+                        arg(2, "target nick")?.to_string()
+                    },
                 })
             }
             "KICK" => Ok(Command::Kick {
@@ -202,7 +267,14 @@ impl Command {
             "QUIT" => Ok(Command::Quit {
                 reason: trailing.unwrap_or("leaving").to_string(),
             }),
-            "PING" => Ok(Command::Ping(trailing.map(str::to_string))),
+            // the spec documents `PING <token>`; a token is accepted with
+            // or without the colon, because a client that sends the bare
+            // form must still be able to match its reply
+            "PING" => Ok(Command::Ping(
+                trailing
+                    .map(str::to_string)
+                    .or_else(|| args.first().map(|s| s.to_string())),
+            )),
             "PONG" => Ok(Command::Pong(trailing.map(str::to_string))),
             "BIN_FRAME" => {
                 let target = arg(0, "target")?;
@@ -238,6 +310,16 @@ impl Command {
             ),
             Command::Join(c) => format!("JOIN {c}"),
             Command::Names(c) => format!("NAMES {c}"),
+            Command::Auth(t) => format!("AUTH {t}"),
+            Command::Cap => "CAP LS".to_string(),
+            Command::Topic { channel, topic } => match topic {
+                Some(t) => format!("TOPIC {channel} :{t}"),
+                None => format!("TOPIC {channel}"),
+            },
+            Command::List => "LIST".to_string(),
+            Command::Who(Some(t)) => format!("WHO {t}"),
+            Command::Who(None) => "WHO".to_string(),
+            Command::Drain => "DRAIN".to_string(),
             Command::Part { channel, reason } => match reason {
                 Some(r) => format!("PART {channel} :{r}"),
                 None => format!("PART {channel}"),
@@ -402,6 +484,15 @@ mod tests {
                 reason: "Heartbeat timeout - dropping session".into(),
             },
             Command::Names("#swarm".into()),
+            Command::Auth("agent_1.123.1f.abcd".into()),
+            Command::Cap,
+            Command::Topic {
+                channel: "#swarm".into(),
+                topic: Some("migration in progress".into()),
+            },
+            Command::List,
+            Command::Who(Some("@pool:coder".into())),
+            Command::Drain,
             Command::Ping(Some("tok".into())),
             Command::BinFrame {
                 target: "#swarm".into(),
@@ -423,7 +514,7 @@ mod tests {
             ("STATUS ag 0x09 1 0", "unknown presence state"),
             ("STATUS ag 0x00 many 0", "vram_free_mb"),
             ("PRIVMSG #c no-colon-text", "missing ':text'"),
-            ("MODE #c +x ag", "unsupported channel flag"),
+            ("MODE #c +x ag", "unsupported flag"),
             ("MODE #c o ag", "must start with '+' or '-'"),
             ("BOGUS #c", "unknown command"),
             ("", "empty command"),

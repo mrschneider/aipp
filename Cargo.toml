@@ -12,3 +12,5 @@ repository = "https://github.com/mrschneider/aipp"
 [workspace.dependencies]
 aipp-core = { path = "aipp-core" }
 serde_json = "1"
+hmac = "0.12"
+sha2 = "0.10"

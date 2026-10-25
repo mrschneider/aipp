@@ -116,6 +116,10 @@ struct Broker {
     /// relay message ids already seen: flooding without dedup is a storm
     seen: VecDeque<String>,
     seq: u64,
+    /// privacy lists, persisted: ag-id -> who may message it (permit,
+    /// when non-empty) and who never may (ignore).
+    permits: BTreeMap<String, BTreeSet<String>>,
+    ignores: BTreeMap<String, BTreeSet<String>>,
     /// server-side roster: ag-id -> the targets it follows. Survives a
     /// restart, so an agent that registers inherits its social context.
     rosters: BTreeMap<String, BTreeSet<String>>,
@@ -142,6 +146,8 @@ impl Broker {
             seen: VecDeque::new(),
             seq: 0,
             rosters: BTreeMap::new(),
+            permits: BTreeMap::new(),
+            ignores: BTreeMap::new(),
         }
     }
 
@@ -208,11 +214,27 @@ impl Broker {
                 )
             })
             .collect();
-        let doc = json!({"version": 1, "channels": chans, "rosters": rosters});
+        let doc = json!({"version": 1, "channels": chans, "rosters": rosters,
+                          "permits": self.privacy_json(&self.permits),
+                          "ignores": self.privacy_json(&self.ignores)});
         let tmp = path.with_extension("tmp");
         if std::fs::write(&tmp, doc.to_string()).is_ok() {
             let _ = std::fs::rename(&tmp, path);
         }
+    }
+
+    fn privacy_json(
+        &self,
+        m: &BTreeMap<String, BTreeSet<String>>,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        m.iter()
+            .map(|(ag, set)| {
+                (
+                    ag.clone(),
+                    json!(set.iter().cloned().collect::<Vec<String>>()),
+                )
+            })
+            .collect()
     }
 
     fn load_state(&mut self) {
@@ -224,6 +246,23 @@ impl Broker {
             eprintln!("[aipp] state file {path:?} is not valid JSON; ignoring it");
             return;
         };
+        for (key, slot) in [
+            ("permits", &mut self.permits),
+            ("ignores", &mut self.ignores),
+        ] {
+            if let Some(obj) = doc.get(key).and_then(|v| v.as_object()) {
+                for (ag, list) in obj {
+                    if let Some(arr) = list.as_array() {
+                        slot.insert(
+                            ag.clone(),
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(str::to_string))
+                                .collect(),
+                        );
+                    }
+                }
+            }
+        }
         if let Some(rs) = doc.get("rosters").and_then(|r| r.as_object()) {
             for (ag, list) in rs {
                 if let Some(arr) = list.as_array() {
@@ -264,6 +303,26 @@ impl Broker {
                 );
             }
         }
+    }
+
+    /// Privacy gate: `Err(numeric, text)` when the sender may not reach
+    /// the target. Permit-list non-empty acts as allow-list mode; ignore
+    /// always wins.
+    fn sender_may_reach(&self, sender: &str, target: &str) -> Result<(), (u16, String)> {
+        if self.ignores.get(target).is_some_and(|s| s.contains(sender)) {
+            return Err((486, format!("{sender} :you are on {target}'s ignore list")));
+        }
+        if self
+            .permits
+            .get(target)
+            .is_some_and(|s| !s.is_empty() && !s.contains(sender))
+        {
+            return Err((
+                487,
+                format!("{sender} :you are not authorized to message {target}"),
+            ));
+        }
+        Ok(())
     }
 
     fn saw(&mut self, msg_id: &str) -> bool {
@@ -319,6 +378,19 @@ impl Broker {
             .values()
             .find(|c| c.name.lock().unwrap().as_deref() == Some(name))
             .cloned()
+    }
+
+    /// Same as `broadcast_presence`, minus agents that ignore `agent`.
+    fn broadcast_presence_filtered(&self, agent: &str, line: &str) {
+        let ignored = self.ignores.get(agent);
+        for c in self.everyone() {
+            if let Some(name) = c.name.lock().unwrap().as_deref() {
+                if ignored.is_some_and(|s| s.contains(name)) {
+                    continue;
+                }
+            }
+            c.send_line(line);
+        }
     }
 
     /// Broadcast one control line to every agent sharing a channel with
@@ -1053,7 +1125,7 @@ fn handle_line(broker: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, line: &str) -> Res
                     .filter(|(_, set)| set.contains(&me))
                     .map(|(ag, _)| ag.clone())
                     .collect();
-                b.broadcast_presence(&me, &line_out);
+                b.broadcast_presence_filtered(&me, &line_out);
                 for w in watchers {
                     if let Some(c) = b.conn_of(&w) {
                         c.send_line(&line_out);
@@ -1217,6 +1289,17 @@ fn handle_line(broker: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, line: &str) -> Res
                     drop(b);
                     reply_err(conn, 404, &format!("{target} :you are not voiced (+m)"));
                     return Ok(());
+                }
+                if !target.starts_with('#') {
+                    if let Err((num, why)) = b.sender_may_reach(&me, &target) {
+                        b.journal(
+                            "privacy_refused",
+                            json!({"from": me, "to": target, "numeric": num}),
+                        );
+                        drop(b);
+                        reply_err(conn, num, &why);
+                        return Ok(());
+                    }
                 }
                 recipients = b.targets(&target, &me);
             }
@@ -1481,6 +1564,91 @@ fn handle_line(broker: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, line: &str) -> Res
             conn.send_line(&format!(
                 "DRAINING {me} :new tasks will not be dispatched to you"
             ));
+        }
+        Command::Typing(target) => {
+            let me = name_of(conn).unwrap();
+            let mut gate = None;
+            if !target.starts_with('#') {
+                let b = broker.lock().unwrap();
+                gate = b.sender_may_reach(&me, &target).err();
+            }
+            if let Some((num, why)) = gate {
+                reply_err(conn, num, &why);
+                return Ok(());
+            }
+            let line = format!(":{me} TYPING {target}");
+            if target.starts_with('#') {
+                let recipients = {
+                    let b = broker.lock().unwrap();
+                    b.targets(&target, &me)
+                };
+                for c in recipients {
+                    c.send_line(&line);
+                }
+            } else {
+                let c = {
+                    let b = broker.lock().unwrap();
+                    b.conn_of(&target)
+                };
+                if let Some(c) = c {
+                    c.send_line(&line);
+                }
+            }
+        }
+        Command::Privacy { list, op, target } => {
+            use aipp_core::control::{PrivacyList as PL, PrivacyOp as PO};
+            let me = name_of(conn).unwrap();
+            let mut b = broker.lock().unwrap();
+            let slot = match list {
+                PL::Permit => b.permits.entry(me.clone()).or_default(),
+                PL::Ignore => b.ignores.entry(me.clone()).or_default(),
+            };
+            match op {
+                PO::List => {
+                    let items: Vec<String> = slot.iter().cloned().collect();
+                    let label = match list {
+                        PL::Permit => "PERMIT",
+                        PL::Ignore => "IGNORE",
+                    };
+                    drop(b);
+                    conn.send_line(&format!("{label}_START {}", items.len()));
+                    for it in items {
+                        conn.send_line(&format!("{label} {it}"));
+                    }
+                    conn.send_line(&format!("{label}_END"));
+                }
+                PO::Add => {
+                    let t = target.unwrap_or_default();
+                    if t.is_empty() {
+                        drop(b);
+                        reply_err(conn, 461, "this op needs an ag-id");
+                        return Ok(());
+                    }
+                    slot.insert(t.clone());
+                    b.save_state();
+                    b.journal("privacy_add", json!({"ag_id": me, "target": t}));
+                    drop(b);
+                    conn.send_line("PRIVACY_OK");
+                }
+                PO::Del => {
+                    let t = target.unwrap_or_default();
+                    let removed = slot.remove(&t);
+                    if slot.is_empty() {
+                        match list {
+                            PL::Permit => b.permits.remove(&me),
+                            PL::Ignore => b.ignores.remove(&me),
+                        };
+                    }
+                    b.save_state();
+                    b.journal("privacy_del", json!({"ag_id": me, "target": t}));
+                    drop(b);
+                    if removed {
+                        conn.send_line("PRIVACY_OK");
+                    } else {
+                        reply_err(conn, 401, "not in the list");
+                    }
+                }
+            }
         }
         Command::Roster { op, target } => {
             let me = name_of(conn).unwrap();

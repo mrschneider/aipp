@@ -76,6 +76,17 @@ pub enum Command {
     Who(Option<String>),
     /// `DRAIN` — stop accepting new work, finish what is in flight.
     Drain,
+    /// `TYPING <target>` — the ICQ typing event: announce before the
+    /// token stream starts, so the receiver can prepare buffers.
+    Typing(String),
+    /// privacy lists: `PERMIT ADD|DEL|LIST [ag-id]` (allow-list mode) and
+    /// `IGNORE ADD|DEL|LIST [ag-id]` (deny list). ICQ's visibility and
+    /// ignore lists, applied to senders.
+    Privacy {
+        list: PrivacyList,
+        op: PrivacyOp,
+        target: Option<String>,
+    },
     /// server-side roster: `ROSTER ADD <target>` / `ROSTER DEL <target>` /
     /// `ROSTER` — the contact list the broker persists for this agent.
     Roster {
@@ -105,6 +116,19 @@ fn split_trailing(line: &str) -> (Vec<&str>, Option<&str>) {
 
 /// `@pool:name` addresses a group of agents; the broker picks a live one
 /// by presence. `#channel` addresses a channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrivacyList {
+    Permit,
+    Ignore,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrivacyOp {
+    List,
+    Add,
+    Del,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RosterOp {
     List,
@@ -226,6 +250,27 @@ impl Command {
                 Ok(Command::Who(args.first().map(|s| s.to_string())))
             }
             "DRAIN" => Ok(Command::Drain),
+            "TYPING" => Ok(Command::Typing(arg(0, "target")?.to_string())),
+            "PERMIT" | "IGNORE" => {
+                let list = if cmd == "PERMIT" {
+                    PrivacyList::Permit
+                } else {
+                    PrivacyList::Ignore
+                };
+                let op = match args.first().map(|s| s.to_ascii_uppercase()).as_deref() {
+                    None | Some("LIST") => PrivacyOp::List,
+                    Some("ADD") => PrivacyOp::Add,
+                    Some("DEL") | Some("REMOVE") => PrivacyOp::Del,
+                    Some(other) => {
+                        return Err(format!("{cmd}: unknown op '{other}' (LIST, ADD, DEL)"))
+                    }
+                };
+                let target = match op {
+                    PrivacyOp::List => None,
+                    _ => Some(arg(1, "ag-id")?.to_string()),
+                };
+                Ok(Command::Privacy { list, op, target })
+            }
             "ROSTER" => {
                 let op = match args.first().map(|s| s.to_ascii_uppercase()).as_deref() {
                     None | Some("LIST") => RosterOp::List,
@@ -366,6 +411,19 @@ impl Command {
             Command::Who(Some(t)) => format!("WHO {t}"),
             Command::Who(None) => "WHO".to_string(),
             Command::Drain => "DRAIN".to_string(),
+            Command::Typing(t) => format!("TYPING {t}"),
+            Command::Privacy { list, op, target } => {
+                let l = match list {
+                    PrivacyList::Permit => "PERMIT",
+                    PrivacyList::Ignore => "IGNORE",
+                };
+                match (op, target) {
+                    (PrivacyOp::List, _) => format!("{l} LIST"),
+                    (PrivacyOp::Add, Some(t)) => format!("{l} ADD {t}"),
+                    (PrivacyOp::Del, Some(t)) => format!("{l} DEL {t}"),
+                    _ => format!("{l}"),
+                }
+            }
             Command::Roster { op, target } => match (op, target) {
                 (RosterOp::List, _) => "ROSTER LIST".to_string(),
                 (RosterOp::Add, Some(t)) => format!("ROSTER ADD {t}"),
@@ -554,6 +612,12 @@ mod tests {
             Command::List,
             Command::Who(Some("@pool:coder".into())),
             Command::Drain,
+            Command::Typing("#swarm".into()),
+            Command::Privacy {
+                list: PrivacyList::Ignore,
+                op: PrivacyOp::Add,
+                target: Some("spammer".into()),
+            },
             Command::Roster {
                 op: RosterOp::Add,
                 target: Some("#swarm".into()),

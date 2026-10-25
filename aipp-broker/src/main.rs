@@ -17,7 +17,7 @@
 
 use aipp_core::channel::Registry;
 use aipp_core::control::is_pool;
-use aipp_core::control::Command;
+use aipp_core::control::{Command, RosterOp};
 use aipp_core::flow::{FlowError, Outbox};
 use aipp_core::presence::AgentRecord;
 use aipp_core::security::{cap, Authority, Identity, RateLimiter};
@@ -116,6 +116,21 @@ struct Broker {
     /// relay message ids already seen: flooding without dedup is a storm
     seen: VecDeque<String>,
     seq: u64,
+    /// privacy lists, persisted: ag-id -> who may message it (permit,
+    /// when non-empty) and who never may (ignore).
+    /// reverse paths for flooded requests: msg-id -> (came in on, sent to)
+    floods: BTreeMap<String, (Option<u64>, Vec<u64>)>,
+    /// local sender waiting for the ack of its own relay
+    relay_waiters: BTreeMap<String, u64>,
+    /// local agent waiting for directory results
+    find_waiters: BTreeMap<String, u64>,
+    /// watchers that registered on OTHER brokers for a local target
+    remote_watchers: BTreeMap<String, BTreeSet<String>>,
+    permits: BTreeMap<String, BTreeSet<String>>,
+    ignores: BTreeMap<String, BTreeSet<String>>,
+    /// server-side roster: ag-id -> the targets it follows. Survives a
+    /// restart, so an agent that registers inherits its social context.
+    rosters: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl Broker {
@@ -138,6 +153,13 @@ impl Broker {
             broker_id: String::new(),
             seen: VecDeque::new(),
             seq: 0,
+            rosters: BTreeMap::new(),
+            floods: BTreeMap::new(),
+            relay_waiters: BTreeMap::new(),
+            find_waiters: BTreeMap::new(),
+            remote_watchers: BTreeMap::new(),
+            permits: BTreeMap::new(),
+            ignores: BTreeMap::new(),
         }
     }
 
@@ -194,11 +216,37 @@ impl Broker {
                        "topic": c.topic, "bans": c.bans})
             })
             .collect();
-        let doc = json!({"version": 1, "channels": chans});
+        let rosters: serde_json::Map<String, serde_json::Value> = self
+            .rosters
+            .iter()
+            .map(|(ag, set)| {
+                (
+                    ag.clone(),
+                    json!(set.iter().cloned().collect::<Vec<String>>()),
+                )
+            })
+            .collect();
+        let doc = json!({"version": 1, "channels": chans, "rosters": rosters,
+                          "permits": self.privacy_json(&self.permits),
+                          "ignores": self.privacy_json(&self.ignores)});
         let tmp = path.with_extension("tmp");
         if std::fs::write(&tmp, doc.to_string()).is_ok() {
             let _ = std::fs::rename(&tmp, path);
         }
+    }
+
+    fn privacy_json(
+        &self,
+        m: &BTreeMap<String, BTreeSet<String>>,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        m.iter()
+            .map(|(ag, set)| {
+                (
+                    ag.clone(),
+                    json!(set.iter().cloned().collect::<Vec<String>>()),
+                )
+            })
+            .collect()
     }
 
     fn load_state(&mut self) {
@@ -210,6 +258,34 @@ impl Broker {
             eprintln!("[aipp] state file {path:?} is not valid JSON; ignoring it");
             return;
         };
+        for (key, slot) in [
+            ("permits", &mut self.permits),
+            ("ignores", &mut self.ignores),
+        ] {
+            if let Some(obj) = doc.get(key).and_then(|v| v.as_object()) {
+                for (ag, list) in obj {
+                    if let Some(arr) = list.as_array() {
+                        slot.insert(
+                            ag.clone(),
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(str::to_string))
+                                .collect(),
+                        );
+                    }
+                }
+            }
+        }
+        if let Some(rs) = doc.get("rosters").and_then(|r| r.as_object()) {
+            for (ag, list) in rs {
+                if let Some(arr) = list.as_array() {
+                    let set: BTreeSet<String> = arr
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect();
+                    self.rosters.insert(ag.clone(), set);
+                }
+            }
+        }
         if let Some(chans) = doc.get("channels").and_then(|c| c.as_array()) {
             for c in chans {
                 let name = c.get("name").and_then(|v| v.as_str()).unwrap_or_default();
@@ -237,6 +313,35 @@ impl Broker {
                         })
                         .unwrap_or_default(),
                 );
+            }
+        }
+    }
+
+    /// Privacy gate: `Err(numeric, text)` when the sender may not reach
+    /// the target. Permit-list non-empty acts as allow-list mode; ignore
+    /// always wins.
+    fn sender_may_reach(&self, sender: &str, target: &str) -> Result<(), (u16, String)> {
+        if self.ignores.get(target).is_some_and(|s| s.contains(sender)) {
+            return Err((486, format!("{sender} :you are on {target}'s ignore list")));
+        }
+        if self
+            .permits
+            .get(target)
+            .is_some_and(|s| !s.is_empty() && !s.contains(sender))
+        {
+            return Err((
+                487,
+                format!("{sender} :you are not authorized to message {target}"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn remember_flood(&mut self, msg_id: &str, from: Option<u64>, to: Vec<u64>) {
+        self.floods.insert(msg_id.to_string(), (from, to));
+        while self.floods.len() > 4096 {
+            if let Some(k) = self.floods.keys().next().cloned() {
+                self.floods.remove(&k);
             }
         }
     }
@@ -296,8 +401,22 @@ impl Broker {
             .cloned()
     }
 
+    /// Same as `broadcast_presence`, minus agents that ignore `agent`.
+    fn broadcast_presence_filtered(&self, agent: &str, line: &str) {
+        let ignored = self.ignores.get(agent);
+        for c in self.everyone() {
+            if let Some(name) = c.name.lock().unwrap().as_deref() {
+                if ignored.is_some_and(|s| s.contains(name)) {
+                    continue;
+                }
+            }
+            c.send_line(line);
+        }
+    }
+
     /// Broadcast one control line to every agent sharing a channel with
     /// `agent` (presence is only visible to peers that can act on it).
+    #[allow(dead_code)] // superseded by broadcast_presence_filtered
     fn broadcast_presence(&self, agent: &str, line: &str) {
         let mut peers: BTreeMap<String, Arc<Conn>> = BTreeMap::new();
         for chan in self.reg.channel_names() {
@@ -761,7 +880,7 @@ fn read_item(reader: &mut BufReader<TcpStream>) -> std::io::Result<Option<Item>>
 
 /// Register a link. Both directions land here: the dialer sees
 /// `FEDERATED <id>`, the acceptor sees `FEDERATE <id>`.
-fn handle_federate(broker: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, peer_id: &str) {
+fn handle_federate(broker: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, peer_id: &str, reply: bool) {
     if peer_id.is_empty() {
         conn.send_line("ERR 461 :FEDERATE needs a broker id");
         return;
@@ -774,7 +893,9 @@ fn handle_federate(broker: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, peer_id: &str)
     *conn.peer_id.lock().unwrap() = Some(peer_id.to_string());
     b_journal(broker, "federate", json!({"peer": peer_id}));
     // the acceptor answers; the dialer learns the peer's id
-    conn.send_line(&format!("FEDERATED {my_id}"));
+    if reply {
+        conn.send_line(&format!("FEDERATED {my_id}"));
+    }
 }
 
 fn b_journal(broker: &Arc<Mutex<Broker>>, ev: &str, detail: serde_json::Value) {
@@ -807,6 +928,7 @@ fn handle_relay(broker: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, line: &str) {
             return;
         }
         my_id = b.broker_id.clone();
+        b.remember_flood(msg_id, Some(conn.id), Vec::new());
         if origin == my_id {
             // it came home: every other broker already saw it
             b.journal("relay_returned", json!({"id": msg_id}));
@@ -821,6 +943,12 @@ fn handle_relay(broker: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, line: &str) {
         if b.agents.contains_key(&target) {
             // it lives here: deliver, or hold it if the agent is offline
             let line = format!(":{sender} PRIVMSG {target} :{text}");
+            // the ack walks the reverse path: at-least-once replaces
+            // "entered the mesh, good luck"
+            let (from, _) = b.floods.get(msg_id).cloned().unwrap_or((None, Vec::new()));
+            if let Some(upstream) = from.and_then(|id| b.conns.get(&id).cloned()) {
+                upstream.send_line(&format!("RELAY_ACK {msg_id}"));
+            }
             match b.conn_of(&target) {
                 Some(c) => c.send_line(&line),
                 None => {
@@ -845,6 +973,8 @@ fn handle_relay(broker: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, line: &str) {
             .filter(|p| !Arc::ptr_eq(p, conn))
             .cloned()
             .collect();
+        let fwd_ids: Vec<u64> = peers.iter().map(|p| p.id).collect();
+        b.remember_flood(msg_id, Some(conn.id), fwd_ids);
         if peers.is_empty() {
             b.journal("relay_dead_end", json!({"id": msg_id, "to": target}));
             return;
@@ -872,11 +1002,253 @@ fn handle_line(broker: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, line: &str) -> Res
     // is intercepted before Command::parse so agents can never forge it
     let trimmed = line.trim();
     if let Some(rest) = trimmed.strip_prefix("FEDERATE ") {
-        handle_federate(broker, conn, rest.trim());
+        handle_federate(broker, conn, rest.trim(), true);
         return Ok(());
     }
     if let Some(rest) = trimmed.strip_prefix("FEDERATED ") {
-        handle_federate(broker, conn, rest.trim());
+        // a response registers the link and answers nothing: replying to a
+        // reply is an infinite echo between the two brokers
+        handle_federate(broker, conn, rest.trim(), false);
+        return Ok(());
+    }
+    if let Some(rest) = trimmed.strip_prefix("FIND_RELAY ") {
+        // <msg-id> <hops> <origin> <query...>
+        let parts: Vec<&str> = rest.splitn(4, ' ').collect();
+        if parts.len() >= 4 {
+            let (msg_id, hops, query) = (parts[0], parts[1], parts[3].to_string());
+            let done = {
+                let mut b = broker.lock().unwrap();
+                if b.saw(msg_id) {
+                    true
+                } else {
+                    let my_id = b.broker_id.clone();
+                    // local matches answer on the reverse path
+                    let matches: Vec<String> = b
+                        .agents
+                        .values()
+                        .filter(|a| {
+                            let hay = format!(
+                                "{} {} {}",
+                                a.ag_id,
+                                a.class,
+                                a.status_text.as_deref().unwrap_or("")
+                            )
+                            .to_lowercase();
+                            hay.contains(&query.to_lowercase())
+                        })
+                        .map(|a| {
+                            format!(
+                                "FOUND_RELAY {msg_id} {} {} {} :{}",
+                                a.ag_id,
+                                a.class,
+                                a.state.hex(),
+                                a.status_text.as_deref().unwrap_or("")
+                            )
+                        })
+                        .collect();
+                    let (from, _) = b
+                        .floods
+                        .get(msg_id)
+                        .cloned()
+                        .unwrap_or((Some(conn.id), Vec::new()));
+                    if let Some(up) = from.and_then(|id| b.conns.get(&id).cloned()) {
+                        for m in &matches {
+                            up.send_line(m);
+                        }
+                    }
+                    b.remember_flood(msg_id, Some(conn.id), Vec::new());
+                    b.journal(
+                        "find_relay",
+                        json!({"id": msg_id, "query": query, "matches": matches.len()}),
+                    );
+                    if hops.parse::<usize>().unwrap_or(99) < 8 {
+                        let peers: Vec<Arc<Conn>> = b
+                            .peers
+                            .values()
+                            .filter(|p| !Arc::ptr_eq(p, conn))
+                            .cloned()
+                            .collect();
+                        let ids: Vec<u64> = peers.iter().map(|p| p.id).collect();
+                        b.remember_flood(msg_id, Some(conn.id), ids);
+                        let fwd = format!(
+                            "FIND_RELAY {msg_id} {} {my_id} {query}",
+                            hops.parse::<usize>().unwrap_or(0) + 1
+                        );
+                        for p in &peers {
+                            p.send_line(&fwd);
+                        }
+                    }
+                    true
+                }
+            };
+            if done {
+                return Ok(());
+            }
+        }
+    }
+    if let Some(rest) = trimmed.strip_prefix("FOUND_RELAY ") {
+        // <msg-id> <ag-id> <class> <state> :<status text>
+        let parts: Vec<&str> = rest.splitn(5, ' ').collect();
+        if parts.len() >= 5 {
+            let msg_id = parts[0];
+            let done = {
+                let mut b = broker.lock().unwrap();
+                if msg_id.starts_with(&b.broker_id) {
+                    if let Some(waiter) = b.find_waiters.remove(msg_id) {
+                        if let Some(c) = b.conns.get(&waiter).cloned() {
+                            c.send_line(&format!(
+                                "FOUND {} {} {} {}",
+                                parts[1], parts[2], parts[3], parts[4]
+                            ));
+                        }
+                    }
+                    true
+                } else {
+                    if let Some((from, _)) = b.floods.get(msg_id).cloned() {
+                        if let Some(up) = from.and_then(|id| b.conns.get(&id).cloned()) {
+                            up.send_line(trimmed);
+                        }
+                    }
+                    true
+                }
+            };
+            if done {
+                return Ok(());
+            }
+        }
+    }
+    if let Some(rest) = trimmed.strip_prefix("ROSTER_SUB ") {
+        let parts: Vec<&str> = rest.splitn(4, ' ').collect();
+        if parts.len() == 4 {
+            let (msg_id, hops, watcher, target) = (parts[0], parts[1], parts[2], parts[3]);
+            let done = {
+                let mut b = broker.lock().unwrap();
+                if !b.saw(msg_id) {
+                    b.remote_watchers
+                        .entry(target.to_string())
+                        .or_default()
+                        .insert(watcher.to_string());
+                    b.journal("roster_sub", json!({"target": target, "watcher": watcher}));
+                    if hops.parse::<usize>().unwrap_or(99) < 8 {
+                        let peers: Vec<Arc<Conn>> = b
+                            .peers
+                            .values()
+                            .filter(|p| !Arc::ptr_eq(p, conn))
+                            .cloned()
+                            .collect();
+                        let ids: Vec<u64> = peers.iter().map(|p| p.id).collect();
+                        b.remember_flood(msg_id, Some(conn.id), ids);
+                        let fwd = format!(
+                            "ROSTER_SUB {msg_id} {} {watcher} {target}",
+                            hops.parse::<usize>().unwrap_or(0) + 1
+                        );
+                        for p in &peers {
+                            p.send_line(&fwd);
+                        }
+                    }
+                }
+                true
+            };
+            if done {
+                return Ok(());
+            }
+        }
+    }
+    if let Some(rest) = trimmed.strip_prefix("PRESENCE_RELAY ") {
+        let parts: Vec<&str> = rest.splitn(3, ' ').collect();
+        if parts.len() == 3 {
+            let done = {
+                let b = broker.lock().unwrap();
+                if let Some(c) = b.conn_of(parts[1]) {
+                    c.send_line(parts[2]);
+                }
+                true
+            };
+            if done {
+                return Ok(());
+            }
+        }
+    }
+    if let Some(rest) = trimmed.strip_prefix("RELAY_ACK ") {
+        let msg_id = rest.trim();
+        let done = {
+            let mut b = broker.lock().unwrap();
+            if msg_id.starts_with(&b.broker_id) {
+                if let Some(waiter) = b.relay_waiters.remove(msg_id) {
+                    if let Some(c) = b.conns.get(&waiter).cloned() {
+                        c.send_line(&format!("DELIVERED {msg_id}"));
+                    }
+                }
+                b.journal("relay_acked", json!({"id": msg_id}));
+                true
+            } else {
+                // walk the reverse path toward the origin
+                if let Some((from, _)) = b.floods.get(msg_id).cloned() {
+                    if let Some(up) = from.and_then(|id| b.conns.get(&id).cloned()) {
+                        up.send_line(&format!("RELAY_ACK {msg_id}"));
+                    }
+                }
+                b.journal("relay_ack_relayed", json!({"id": msg_id}));
+                true
+            }
+        };
+        if done {
+            return Ok(());
+        }
+    }
+    if let Some(query) = trimmed.strip_prefix("FIND ") {
+        let query = query.trim().to_string();
+        if query.is_empty() {
+            reply_err(conn, 461, "FIND needs a query");
+            return Ok(());
+        }
+        let msg_id = {
+            let mut b = broker.lock().unwrap();
+            let id = b.next_msg_id();
+            let matches: Vec<String> = b
+                .agents
+                .values()
+                .filter(|a| {
+                    let hay = format!(
+                        "{} {} {}",
+                        a.ag_id,
+                        a.class,
+                        a.status_text.as_deref().unwrap_or("")
+                    )
+                    .to_lowercase();
+                    hay.contains(&query.to_lowercase())
+                })
+                .map(|a| {
+                    format!(
+                        "FOUND {} {} {} :{}",
+                        a.ag_id,
+                        a.class,
+                        a.state.hex(),
+                        a.status_text.as_deref().unwrap_or("")
+                    )
+                })
+                .collect();
+            let n = b.peers.len();
+            if n > 0 {
+                let fwd = format!("FIND_RELAY {id} 0 {} {query}", b.broker_id.clone());
+                let mut ids = Vec::new();
+                for p in b.peers.values() {
+                    ids.push(p.id);
+                    p.send_line(&fwd);
+                }
+                b.remember_flood(&id, None, ids);
+                b.find_waiters.insert(id.clone(), conn.id);
+            }
+            b.journal(
+                "find",
+                json!({"id": id, "query": query, "local": matches.len(), "peers": n}),
+            );
+            for m in matches {
+                conn.send_line(&m);
+            }
+            (id, n)
+        };
+        conn.send_line(&format!("FIND_DONE {}", msg_id.0));
         return Ok(());
     }
     if trimmed.starts_with("RELAY ") {
@@ -994,6 +1366,7 @@ fn handle_line(broker: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, line: &str) -> Res
             state,
             vram_free_mb,
             active_tasks,
+            status_text,
         } => {
             let me = name_of(conn).unwrap();
             if agent != me {
@@ -1005,6 +1378,7 @@ fn handle_line(broker: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, line: &str) -> Res
                 let mut b = broker.lock().unwrap();
                 if let Some(a) = b.agents.get_mut(&me) {
                     a.set_status(state, vram_free_mb, active_tasks);
+                    a.status_text = status_text.clone();
                     a.touch(Instant::now());
                 }
                 line_out = b
@@ -1015,9 +1389,39 @@ fn handle_line(broker: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, line: &str) -> Res
                 b.journal(
                     "status",
                     json!({"ag_id": me, "state": state.label(),
-                           "vram_free_mb": vram_free_mb, "active_tasks": active_tasks}),
+                           "vram_free_mb": vram_free_mb, "active_tasks": active_tasks,
+                           "status_text": status_text}),
                 );
-                b.broadcast_presence(&me, &line_out);
+                // roster subscribers see the presence even without a
+                // shared channel: that is what "following" means
+                let watchers: Vec<String> = b
+                    .rosters
+                    .iter()
+                    .filter(|(_, set)| set.contains(&me))
+                    .map(|(ag, _)| ag.clone())
+                    .collect();
+                b.broadcast_presence_filtered(&me, &line_out);
+                let mut all_watchers = watchers.clone();
+                if let Some(remote) = b.remote_watchers.get(&me) {
+                    all_watchers.extend(remote.iter().cloned());
+                }
+                for w in all_watchers.iter() {
+                    let w = w.as_str();
+                    if let Some(c) = b.conn_of(w) {
+                        c.send_line(&line_out);
+                    } else if !b.peers.is_empty() {
+                        // the watcher lives behind a link: hand the line over
+                        let msg_id = b.next_msg_id();
+                        let fwd = format!("PRESENCE_RELAY {msg_id} {w} {line_out}");
+                        for p in b.peers.values() {
+                            p.send_line(&fwd);
+                        }
+                        b.journal(
+                            "presence_relay",
+                            json!({"watcher": w, "peers": b.peers.len()}),
+                        );
+                    }
+                }
             }
             conn.send_line(&format!("STATS_OK {me}"));
         }
@@ -1152,12 +1556,16 @@ fn handle_line(broker: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, line: &str) -> Res
                     let my_id = b.broker_id.clone();
                     let n = b.peers.len();
                     let fwd = format!("RELAY {msg_id} 0 {my_id} {me} {target} :{text}");
+                    let mut neighbor_ids = Vec::new();
                     for p in b.peers.values() {
+                        neighbor_ids.push(p.id);
                         p.send_line(&fwd);
                     }
+                    b.remember_flood(&msg_id, None, neighbor_ids);
+                    b.relay_waiters.insert(msg_id.clone(), conn.id);
                     b.journal("relay_out", json!({"id": msg_id, "to": target, "peers": n}));
                     drop(b);
-                    conn.send_line(&format!("RELAYED {target} {n}"));
+                    conn.send_line(&format!("RELAYED {msg_id} {target} {n}"));
                     return Ok(());
                 }
                 if !target.starts_with('#') && b.conn_of(&target).is_none() {
@@ -1176,6 +1584,17 @@ fn handle_line(broker: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, line: &str) -> Res
                     drop(b);
                     reply_err(conn, 404, &format!("{target} :you are not voiced (+m)"));
                     return Ok(());
+                }
+                if !target.starts_with('#') {
+                    if let Err((num, why)) = b.sender_may_reach(&me, &target) {
+                        b.journal(
+                            "privacy_refused",
+                            json!({"from": me, "to": target, "numeric": num}),
+                        );
+                        drop(b);
+                        reply_err(conn, num, &why);
+                        return Ok(());
+                    }
                 }
                 recipients = b.targets(&target, &me);
             }
@@ -1440,6 +1859,166 @@ fn handle_line(broker: &Arc<Mutex<Broker>>, conn: &Arc<Conn>, line: &str) -> Res
             conn.send_line(&format!(
                 "DRAINING {me} :new tasks will not be dispatched to you"
             ));
+        }
+        Command::Typing(target) => {
+            let me = name_of(conn).unwrap();
+            let mut gate = None;
+            if !target.starts_with('#') {
+                let b = broker.lock().unwrap();
+                gate = b.sender_may_reach(&me, &target).err();
+            }
+            if let Some((num, why)) = gate {
+                reply_err(conn, num, &why);
+                return Ok(());
+            }
+            let line = format!(":{me} TYPING {target}");
+            if target.starts_with('#') {
+                let recipients = {
+                    let b = broker.lock().unwrap();
+                    b.targets(&target, &me)
+                };
+                for c in recipients {
+                    c.send_line(&line);
+                }
+            } else {
+                let c = {
+                    let b = broker.lock().unwrap();
+                    b.conn_of(&target)
+                };
+                if let Some(c) = c {
+                    c.send_line(&line);
+                }
+            }
+        }
+        Command::Privacy { list, op, target } => {
+            use aipp_core::control::{PrivacyList as PL, PrivacyOp as PO};
+            let me = name_of(conn).unwrap();
+            let mut b = broker.lock().unwrap();
+            let slot = match list {
+                PL::Permit => b.permits.entry(me.clone()).or_default(),
+                PL::Ignore => b.ignores.entry(me.clone()).or_default(),
+            };
+            match op {
+                PO::List => {
+                    let items: Vec<String> = slot.iter().cloned().collect();
+                    let label = match list {
+                        PL::Permit => "PERMIT",
+                        PL::Ignore => "IGNORE",
+                    };
+                    drop(b);
+                    conn.send_line(&format!("{label}_START {}", items.len()));
+                    for it in items {
+                        conn.send_line(&format!("{label} {it}"));
+                    }
+                    conn.send_line(&format!("{label}_END"));
+                }
+                PO::Add => {
+                    let t = target.unwrap_or_default();
+                    if t.is_empty() {
+                        drop(b);
+                        reply_err(conn, 461, "this op needs an ag-id");
+                        return Ok(());
+                    }
+                    slot.insert(t.clone());
+                    b.save_state();
+                    b.journal("privacy_add", json!({"ag_id": me, "target": t}));
+                    drop(b);
+                    conn.send_line("PRIVACY_OK");
+                }
+                PO::Del => {
+                    let t = target.unwrap_or_default();
+                    let removed = slot.remove(&t);
+                    if slot.is_empty() {
+                        match list {
+                            PL::Permit => b.permits.remove(&me),
+                            PL::Ignore => b.ignores.remove(&me),
+                        };
+                    }
+                    b.save_state();
+                    b.journal("privacy_del", json!({"ag_id": me, "target": t}));
+                    drop(b);
+                    if removed {
+                        conn.send_line("PRIVACY_OK");
+                    } else {
+                        reply_err(conn, 401, "not in the list");
+                    }
+                }
+            }
+        }
+        Command::Roster { op, target } => {
+            let me = name_of(conn).unwrap();
+            match op {
+                aipp_core::control::RosterOp::List => {
+                    let rows: Vec<String> = {
+                        let b = broker.lock().unwrap();
+                        b.rosters
+                            .get(&me)
+                            .map(|set| set.iter().cloned().collect())
+                            .unwrap_or_default()
+                    };
+                    conn.send_line(&format!("ROSTER_START {}", rows.len()));
+                    for t in rows {
+                        conn.send_line(&format!("ROSTER {t}"));
+                    }
+                    conn.send_line("ROSTER_END");
+                }
+                RosterOp::Add => {
+                    let t = target.unwrap_or_default();
+                    if t.is_empty() {
+                        reply_err(conn, 461, "ROSTER ADD needs a target");
+                        return Ok(());
+                    }
+                    {
+                        let mut b = broker.lock().unwrap();
+                        if b.agents.contains_key(&t) || t.starts_with('#') {
+                            b.rosters.entry(me.clone()).or_default().insert(t.clone());
+                        } else if !b.peers.is_empty() {
+                            // the target lives behind a link: the broker that
+                            // hosts it must learn who watches it
+                            let msg_id = b.next_msg_id();
+                            // msg-id, hops, watcher, target -- no origin:
+                            // the flood dedups by id, not by address
+                            let fwd = format!("ROSTER_SUB {msg_id} 0 {me} {t}");
+                            for p in b.peers.values() {
+                                p.send_line(&fwd);
+                            }
+                        } else {
+                            drop(b);
+                            reply_err(conn, 401, &format!("No such agent {t}"));
+                            return Ok(());
+                        }
+                        b.save_state();
+                        b.journal("roster_add", json!({"ag_id": me, "target": t}));
+                    }
+                    conn.send_line(&format!("ROSTER_ADDED {t}"));
+                }
+                RosterOp::Del => {
+                    let t = target.unwrap_or_default();
+                    let removed = {
+                        let mut b = broker.lock().unwrap();
+                        let mut removed = false;
+                        if let Some(set) = b.rosters.get_mut(&me) {
+                            removed = set.remove(&t);
+                            if set.is_empty() {
+                                b.rosters.remove(&me);
+                            }
+                        }
+                        if removed {
+                            b.save_state();
+                        }
+                        b.journal(
+                            "roster_del",
+                            json!({"ag_id": me, "target": t, "removed": removed}),
+                        );
+                        removed
+                    };
+                    if removed {
+                        conn.send_line(&format!("ROSTER_REMOVED {t}"));
+                    } else {
+                        reply_err(conn, 401, &format!("{t} is not in your roster"));
+                    }
+                }
+            }
         }
         Command::Quit { reason } => {
             let me = name_of(conn).unwrap();

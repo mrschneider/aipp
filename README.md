@@ -227,6 +227,7 @@ Stated, not implied:
 
 | Version | What landed |
 |---|---|
+| **v0.5.0** | the ICQ feature set: delivery acks across the mesh (at-least-once), DND + away message, server-side roster, privacy lists (permit/ignore), typing events, federated directory search |
 | **v0.4.0** | store-and-forward, channel persistence, TLS on both planes, federation |
 | v0.3.0 | identity (AUTH + capabilities), backpressure (Outbox), presence-aware dispatch (`@pool`, `DRAIN`), full channel modes, TLV fragmentation, rate limiting, audit chain |
 | v0.2.0 | dual-plane E2E proof, broker, presence TTL, JSONL journal |
